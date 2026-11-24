@@ -31,3 +31,20 @@ target_link_libraries(PayBridgeSimulator
     PRIVATE nlohmann_json::nlohmann_json ws2_32 ole32
 )
 
+
+add_executable(TransactionEngineTests
+    tests/TransactionEngineTests.cpp
+    src/core/TransactionEngine.cpp
+    src/core/TransactionLogger.cpp
+)
+
+target_link_libraries(TransactionEngineTests
+    PRIVATE ole32
+)
+
+enable_testing()
+
+add_test(
+    NAME TransactionEngineTests
+    COMMAND TransactionEngineTests
+)

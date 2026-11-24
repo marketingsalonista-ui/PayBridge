@@ -1,7 +1,9 @@
-﻿#pragma once
+﻿
+#pragma once
 
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 
 enum class TransactionStatus
 {
@@ -17,6 +19,7 @@ enum class TransactionStatus
 struct Transaction
 {
     std::string transactionId;
+    std::string externalReference;
     std::int64_t amountMinor = 0;
     std::string currency;
     TransactionStatus status = TransactionStatus::INVALID;
@@ -25,9 +28,12 @@ struct Transaction
 class TransactionEngine
 {
 public:
+    TransactionEngine();
+
     Transaction createTransaction(
         std::int64_t amountMinor,
-        const std::string& currency
+        const std::string& currency,
+        const std::string& externalReference
     );
 
     bool updateStatus(
@@ -42,4 +48,13 @@ private:
         std::int64_t amountMinor,
         const std::string& currency
     );
+
+    static bool isValidTransition(
+        TransactionStatus currentStatus,
+        TransactionStatus newStatus
+    );
+
+    std::unordered_map<std::string, Transaction> transactionsByReference;
+
+    void restoreTransactions();
 };

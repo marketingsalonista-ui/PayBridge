@@ -1,8 +1,27 @@
-﻿#include "TransactionEngine.h"
+﻿
+#include "TransactionEngine.h"
+#include "TransactionLogger.h"
 
 #include <iomanip>
 #include <sstream>
 #include <objbase.h>
+
+TransactionEngine::TransactionEngine()
+{
+    restoreTransactions();
+}
+
+void TransactionEngine::restoreTransactions()
+{
+    const auto savedTransactions =
+        TransactionLogger::loadTransactions();
+
+    for (const auto& transaction : savedTransactions)
+    {
+        transactionsByReference[transaction.externalReference] =
+            transaction;
+    }
+}
 
 bool TransactionEngine::validateTransaction(
     std::int64_t amountMinor,
@@ -25,17 +44,36 @@ bool TransactionEngine::validateTransaction(
 
 Transaction TransactionEngine::createTransaction(
     std::int64_t amountMinor,
-    const std::string& currency)
+    const std::string& currency,
+    const std::string& externalReference)
 {
     Transaction transaction;
 
     transaction.amountMinor = amountMinor;
     transaction.currency = currency;
+    transaction.externalReference = externalReference;
 
-    if (!validateTransaction(amountMinor, currency))
+    if (!validateTransaction(amountMinor, currency) ||
+        externalReference.empty())
     {
         transaction.status = TransactionStatus::INVALID;
         return transaction;
+    }
+
+    auto existing = transactionsByReference.find(externalReference);
+
+    if (existing != transactionsByReference.end())
+    {
+        const Transaction& previous = existing->second;
+
+        if (previous.amountMinor != amountMinor ||
+            previous.currency != currency)
+        {
+            transaction.status = TransactionStatus::INVALID;
+            return transaction;
+        }
+
+        return previous;
     }
 
     GUID guid{};
@@ -64,6 +102,13 @@ Transaction TransactionEngine::createTransaction(
     transaction.transactionId = id.str();
     transaction.status = TransactionStatus::CREATED;
 
+    transactionsByReference.emplace(
+        externalReference,
+        transaction
+    );
+
+    TransactionLogger::logTransaction(transaction);
+
     return transaction;
 }
 
@@ -74,8 +119,53 @@ bool TransactionEngine::updateStatus(
     if (transaction.transactionId.empty())
         return false;
 
+    if (!isValidTransition(transaction.status, newStatus))
+        return false;
+
     transaction.status = newStatus;
+
+    auto existing = transactionsByReference.find(
+        transaction.externalReference
+    );
+
+    if (existing != transactionsByReference.end())
+    {
+        existing->second = transaction;
+    }
+
+    TransactionLogger::logTransaction(transaction);
+
     return true;
+}
+
+bool TransactionEngine::isValidTransition(
+    TransactionStatus currentStatus,
+    TransactionStatus newStatus)
+{
+    switch (currentStatus)
+    {
+        case TransactionStatus::CREATED:
+            return newStatus == TransactionStatus::SENT ||
+                   newStatus == TransactionStatus::FAILED;
+
+        case TransactionStatus::SENT:
+            return newStatus == TransactionStatus::RECEIVED ||
+                   newStatus == TransactionStatus::FAILED;
+
+        case TransactionStatus::RECEIVED:
+            return newStatus == TransactionStatus::APPROVED ||
+                   newStatus == TransactionStatus::DECLINED ||
+                   newStatus == TransactionStatus::FAILED;
+
+        case TransactionStatus::APPROVED:
+        case TransactionStatus::DECLINED:
+        case TransactionStatus::FAILED:
+        case TransactionStatus::INVALID:
+            return false;
+
+        default:
+            return false;
+    }
 }
 
 std::string TransactionEngine::statusToString(

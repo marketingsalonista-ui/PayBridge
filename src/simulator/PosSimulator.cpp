@@ -31,7 +31,7 @@ int main()
     TransactionEngine engine;
 
     Transaction transaction =
-        engine.createTransaction(amountMinor, "AED");
+         engine.createTransaction(amountMinor, "AED", "POS-TEST-0001");
 
     if (transaction.status != TransactionStatus::CREATED)
     {
