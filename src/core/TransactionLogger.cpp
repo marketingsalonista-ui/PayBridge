@@ -8,15 +8,31 @@
 #include <ctime>
 #include <iomanip>
 #include <sstream>
+#include <mutex>
+#include <vector>
+#include <string>
+#include <stdexcept>
 
 namespace
 {
     const std::string defaultFilename = "logs/transactions.csv";
+
     std::string currentFilename = defaultFilename;
+
+    // Protects logger operations and shared file-path access.
+    std::mutex loggerMutex;
+
+    enum class CsvReadResult
+    {
+        RECORD,
+        END,
+        MALFORMED
+    };
 
     std::string getTimestamp()
     {
         auto now = std::chrono::system_clock::now();
+
         std::time_t currentTime =
             std::chrono::system_clock::to_time_t(now);
 
@@ -29,7 +45,11 @@ namespace
 #endif
 
         std::ostringstream timestamp;
-        timestamp << std::put_time(&localTime, "%Y-%m-%d %H:%M:%S");
+
+        timestamp << std::put_time(
+            &localTime,
+            "%Y-%m-%d %H:%M:%S"
+        );
 
         return timestamp.str();
     }
@@ -45,72 +65,290 @@ namespace
 
         return TransactionStatus::INVALID;
     }
+
+    // Escape CSV fields containing commas, quotes or newlines.
+    std::string escapeCsvField(const std::string& value)
+    {
+        bool needsQuotes =
+            value.find(',') != std::string::npos ||
+            value.find('"') != std::string::npos ||
+            value.find('\n') != std::string::npos ||
+            value.find('\r') != std::string::npos;
+
+        if (!needsQuotes)
+        {
+            return value;
+        }
+
+        std::string escaped = "\"";
+
+        for (char character : value)
+        {
+            if (character == '"')
+            {
+                escaped += "\"\"";
+            }
+            else
+            {
+                escaped += character;
+            }
+        }
+
+        escaped += "\"";
+
+        return escaped;
+    }
+
+    // Skip the remainder of a malformed physical line.
+    void skipToNextLine(std::istream& input)
+    {
+        char character;
+
+        while (input.get(character))
+        {
+            if (character == '\n')
+            {
+                break;
+            }
+        }
+    }
+
+    // Read one complete CSV record.
+    // Newlines inside quoted fields are preserved.
+    CsvReadResult readCsvRecord(
+        std::istream& input,
+        std::vector<std::string>& fields)
+    {
+        fields.clear();
+
+        std::string field;
+
+        bool insideQuotes = false;
+        bool afterClosingQuote = false;
+        bool fieldStarted = false;
+        bool sawCharacter = false;
+
+        char character;
+
+        while (input.get(character))
+        {
+            sawCharacter = true;
+
+            if (insideQuotes)
+            {
+                if (character == '"')
+                {
+                    if (input.peek() == '"')
+                    {
+                        input.get(character);
+                        field += '"';
+                    }
+                    else
+                    {
+                        insideQuotes = false;
+                        afterClosingQuote = true;
+                    }
+                }
+                else
+                {
+                    field += character;
+                }
+
+                continue;
+            }
+
+            if (afterClosingQuote)
+            {
+                if (character == ',')
+                {
+                    fields.push_back(field);
+                    field.clear();
+
+                    afterClosingQuote = false;
+                    fieldStarted = false;
+                }
+                else if (character == '\n')
+                {
+                    fields.push_back(field);
+                    return CsvReadResult::RECORD;
+                }
+                else if (character == '\r' && input.peek() == '\n')
+                {
+                    input.get(character);
+                    fields.push_back(field);
+
+                    return CsvReadResult::RECORD;
+                }
+                else
+                {
+                    skipToNextLine(input);
+                    fields.clear();
+
+                    return CsvReadResult::MALFORMED;
+                }
+
+                continue;
+            }
+
+            if (character == ',')
+            {
+                fields.push_back(field);
+                field.clear();
+                fieldStarted = false;
+            }
+            else if (character == '\n')
+            {
+                if (!field.empty() && field.back() == '\r')
+                {
+                    field.pop_back();
+                }
+
+                fields.push_back(field);
+
+                return CsvReadResult::RECORD;
+            }
+            else if (character == '\r' && input.peek() == '\n')
+            {
+                input.get(character);
+                fields.push_back(field);
+
+                return CsvReadResult::RECORD;
+            }
+            else if (character == '"')
+            {
+                if (fieldStarted || !field.empty())
+                {
+                    skipToNextLine(input);
+                    fields.clear();
+
+                    return CsvReadResult::MALFORMED;
+                }
+
+                insideQuotes = true;
+                fieldStarted = true;
+            }
+            else
+            {
+                field += character;
+                fieldStarted = true;
+            }
+        }
+
+        if (insideQuotes)
+        {
+            fields.clear();
+            return CsvReadResult::MALFORMED;
+        }
+
+        if (!sawCharacter)
+        {
+            return CsvReadResult::END;
+        }
+
+        if (!field.empty() && field.back() == '\r')
+        {
+            field.pop_back();
+        }
+
+        fields.push_back(field);
+
+        return CsvReadResult::RECORD;
+    }
 }
 
 void TransactionLogger::setFilePath(const std::string& path)
 {
+    std::lock_guard<std::mutex> lock(loggerMutex);
+
     if (!path.empty())
+    {
         currentFilename = path;
+    }
 }
 
 void TransactionLogger::resetFilePath()
 {
+    std::lock_guard<std::mutex> lock(loggerMutex);
+
     currentFilename = defaultFilename;
 }
 
 bool TransactionLogger::logTransaction(
     const Transaction& transaction)
 {
+    std::lock_guard<std::mutex> lock(loggerMutex);
+
     try
     {
         std::filesystem::path logPath(currentFilename);
-        std::filesystem::path parent = logPath.parent_path();
+
+        std::filesystem::path parent =
+            logPath.parent_path();
 
         if (!parent.empty())
+        {
             std::filesystem::create_directories(parent);
+        }
 
         bool needsHeader =
             !std::filesystem::exists(currentFilename) ||
             std::filesystem::file_size(currentFilename) == 0;
 
-        std::ofstream file(currentFilename, std::ios::app);
+        std::ofstream file(
+            currentFilename,
+            std::ios::app | std::ios::binary
+        );
 
         if (!file.is_open())
         {
-            std::cerr << "[ERROR] Could not open transaction log.\n";
+            std::cerr
+                << "[ERROR] Could not open transaction log.\n";
+
             return false;
         }
 
         if (needsHeader)
         {
-            file << "TransactionID,ExternalReference,AmountMinor,Currency,Status,Timestamp,Environment\n";
+            file
+                << "TransactionID,ExternalReference,AmountMinor,"
+                << "Currency,Status,Timestamp,Environment\n";
         }
 
-        file << transaction.transactionId << ","
-             << transaction.externalReference << ","
-             << transaction.amountMinor << ","
-             << transaction.currency << ","
-             << TransactionEngine::statusToString(transaction.status) << ","
-             << getTimestamp() << ","
-             << "SIMULATION\n";
+        file
+            << escapeCsvField(transaction.transactionId) << ","
+            << escapeCsvField(transaction.externalReference) << ","
+            << transaction.amountMinor << ","
+            << escapeCsvField(transaction.currency) << ","
+            << escapeCsvField(
+                TransactionEngine::statusToString(
+                    transaction.status
+                )
+            ) << ","
+            << escapeCsvField(getTimestamp()) << ","
+            << escapeCsvField("SIMULATION")
+            << "\n";
 
         file.close();
 
         if (!file)
         {
-            std::cerr << "[ERROR] Failed writing transaction log.\n";
+            std::cerr
+                << "[ERROR] Failed writing transaction log.\n";
+
             return false;
         }
 
-        std::cout << "[LOGGED] Transaction saved to "
-                  << currentFilename << "\n";
+        std::cout
+            << "[LOGGED] Transaction saved to "
+            << currentFilename << "\n";
 
         return true;
     }
     catch (const std::exception& error)
     {
-        std::cerr << "[ERROR] Logging failed: "
-                  << error.what() << "\n";
+        std::cerr
+            << "[ERROR] Logging failed: "
+            << error.what() << "\n";
 
         return false;
     }
@@ -118,44 +356,95 @@ bool TransactionLogger::logTransaction(
 
 std::vector<Transaction> TransactionLogger::loadTransactions()
 {
+    std::lock_guard<std::mutex> lock(loggerMutex);
+
     std::vector<Transaction> transactions;
 
     try
     {
         if (!std::filesystem::exists(currentFilename))
-            return transactions;
-
-        std::ifstream file(currentFilename);
-
-        if (!file.is_open())
         {
-            std::cerr << "[ERROR] Could not read transaction log.\n";
             return transactions;
         }
 
-        std::string line;
+        std::ifstream file(
+            currentFilename,
+            std::ios::binary
+        );
 
-        // Skip CSV header.
-        std::getline(file, line);
-
-        while (std::getline(file, line))
+        if (!file.is_open())
         {
-            std::stringstream row(line);
+            std::cerr
+                << "[ERROR] Could not read transaction log.\n";
+
+            return transactions;
+        }
+
+        std::vector<std::string> fields;
+
+        // Read and validate the header.
+        CsvReadResult headerResult =
+            readCsvRecord(file, fields);
+
+        if (headerResult != CsvReadResult::RECORD)
+        {
+            std::cerr
+                << "[ERROR] Transaction log header is missing or malformed.\n";
+
+            return transactions;
+        }
+
+        int recordNumber = 1;
+
+        while (true)
+        {
+            CsvReadResult result =
+                readCsvRecord(file, fields);
+
+            if (result == CsvReadResult::END)
+            {
+                break;
+            }
+
+            ++recordNumber;
+
+            if (result == CsvReadResult::MALFORMED)
+            {
+                std::cerr
+                    << "[WARNING] Skipping malformed CSV record "
+                    << recordNumber << ".\n";
+
+                continue;
+            }
+
+            if (fields.size() != 7)
+            {
+                std::cerr
+                    << "[WARNING] Skipping CSV record "
+                    << recordNumber
+                    << ": expected 7 columns, found "
+                    << fields.size() << ".\n";
+
+                continue;
+            }
 
             Transaction transaction;
-            std::string amount;
-            std::string status;
-            std::string timestamp;
-            std::string environment;
 
-            if (!std::getline(row, transaction.transactionId, ',') ||
-                !std::getline(row, transaction.externalReference, ',') ||
-                !std::getline(row, amount, ',') ||
-                !std::getline(row, transaction.currency, ',') ||
-                !std::getline(row, status, ',') ||
-                !std::getline(row, timestamp, ',') ||
-                !std::getline(row, environment))
+            transaction.transactionId = fields[0];
+            transaction.externalReference = fields[1];
+            transaction.currency = fields[3];
+
+            const std::string& amount = fields[2];
+            const std::string& status = fields[4];
+
+            if (transaction.transactionId.empty() ||
+                transaction.externalReference.empty() ||
+                transaction.currency.size() != 3)
             {
+                std::cerr
+                    << "[WARNING] Invalid transaction at CSV record "
+                    << recordNumber << ".\n";
+
                 continue;
             }
 
@@ -163,33 +452,43 @@ std::vector<Transaction> TransactionLogger::loadTransactions()
             {
                 std::size_t parsed = 0;
 
-                transaction.amountMinor = std::stoll(amount, &parsed);
+                transaction.amountMinor =
+                    std::stoll(amount, &parsed);
 
                 if (parsed != amount.size() ||
-                    transaction.transactionId.empty() ||
-                    transaction.externalReference.empty() ||
-                    transaction.currency.size() != 3)
+                    transaction.amountMinor <= 0)
                 {
-                    continue;
+                    throw std::invalid_argument("Invalid amount");
                 }
             }
             catch (...)
             {
+                std::cerr
+                    << "[WARNING] Invalid amount at CSV record "
+                    << recordNumber << ".\n";
+
                 continue;
             }
 
             transaction.status = stringToStatus(status);
 
             if (transaction.status == TransactionStatus::INVALID)
+            {
+                std::cerr
+                    << "[WARNING] Invalid status at CSV record "
+                    << recordNumber << ".\n";
+
                 continue;
+            }
 
             transactions.push_back(transaction);
         }
     }
     catch (const std::exception& error)
     {
-        std::cerr << "[ERROR] Loading transactions failed: "
-                  << error.what() << "\n";
+        std::cerr
+            << "[ERROR] Loading transactions failed: "
+            << error.what() << "\n";
     }
 
     return transactions;

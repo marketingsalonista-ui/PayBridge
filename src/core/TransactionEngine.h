@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <mutex>
 
 enum class TransactionStatus
 {
@@ -53,6 +54,9 @@ private:
         TransactionStatus currentStatus,
         TransactionStatus newStatus
     );
+
+    // Protects shared transaction state from concurrent access.
+    std::mutex engineMutex;
 
     std::unordered_map<std::string, Transaction> transactionsByReference;
 

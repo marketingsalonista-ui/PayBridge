@@ -5,14 +5,20 @@
 #include <iostream>
 #include <cassert>
 #include <filesystem>
+#include <fstream>
+#include <thread>
+#include <vector>
+#include <string>
 
 int main()
 {
     const std::string testLog = "transaction_engine_tests.csv";
+    const std::string blockerPath = "transaction_engine_log_blocker";
 
     // Use a separate log so production transaction history is untouched.
     TransactionLogger::setFilePath(testLog);
     std::filesystem::remove(testLog);
+    std::filesystem::remove_all(blockerPath);
 
     {
         TransactionEngine engine;
@@ -104,6 +110,69 @@ int main()
             engine.createTransaction(1000, "AED", "");
 
         assert(emptyReference.status == TransactionStatus::INVALID);
+
+        // Test 18: Modified transaction ID is rejected
+        Transaction idCheck =
+            engine.createTransaction(1000, "AED", "POS-SECURITY-001");
+
+        Transaction alteredId = idCheck;
+        alteredId.transactionId = "PB-FAKE-ID";
+
+        assert(!engine.updateStatus(alteredId, TransactionStatus::SENT));
+        assert(idCheck.status == TransactionStatus::CREATED);
+
+        assert(engine.updateStatus(idCheck, TransactionStatus::SENT));
+
+        // Test 19: Modified amount is rejected
+        Transaction amountCheck =
+            engine.createTransaction(2000, "AED", "POS-SECURITY-002");
+
+        Transaction alteredAmount = amountCheck;
+        alteredAmount.amountMinor = 999999;
+
+        assert(!engine.updateStatus(alteredAmount, TransactionStatus::SENT));
+        assert(amountCheck.status == TransactionStatus::CREATED);
+
+        assert(engine.updateStatus(amountCheck, TransactionStatus::SENT));
+
+        // Test 20: Modified currency is rejected
+        Transaction currencyCheck =
+            engine.createTransaction(3000, "AED", "POS-SECURITY-003");
+
+        Transaction alteredCurrency = currencyCheck;
+        alteredCurrency.currency = "USD";
+
+        assert(!engine.updateStatus(alteredCurrency, TransactionStatus::SENT));
+        assert(currencyCheck.status == TransactionStatus::CREATED);
+
+        assert(engine.updateStatus(currencyCheck, TransactionStatus::SENT));
+
+        // Test 21: Stale transaction status is rejected
+        Transaction staleSource =
+            engine.createTransaction(4000, "AED", "POS-SECURITY-004");
+
+        Transaction staleCopy = staleSource;
+
+        assert(engine.updateStatus(staleSource, TransactionStatus::SENT));
+        assert(engine.updateStatus(staleSource, TransactionStatus::RECEIVED));
+
+        // CREATED -> FAILED is normally valid, but this copy is stale.
+        assert(!engine.updateStatus(staleCopy, TransactionStatus::FAILED));
+        assert(staleSource.status == TransactionStatus::RECEIVED);
+
+        // Test 22: Unknown transaction is rejected
+        Transaction unknownTransaction;
+
+        unknownTransaction.transactionId = "PB-UNKNOWN";
+        unknownTransaction.externalReference = "POS-UNKNOWN-001";
+        unknownTransaction.amountMinor = 1000;
+        unknownTransaction.currency = "AED";
+        unknownTransaction.status = TransactionStatus::CREATED;
+
+        assert(!engine.updateStatus(
+            unknownTransaction,
+            TransactionStatus::SENT
+        ));
     }
 
     // Test 14: Transaction recovery after engine restart
@@ -137,12 +206,174 @@ int main()
         assert(recovered.status == TransactionStatus::APPROVED);
     }
 
+    // Tests 15 and 16: Persistence failure handling
+    {
+        TransactionEngine reliabilityEngine;
+
+        // Create a regular file where the log directory should be.
+        // This deliberately makes log directory creation fail.
+        std::ofstream blocker(blockerPath);
+        assert(blocker.is_open());
+        blocker.close();
+
+        // Test 15: Failed logging must not register a new transaction.
+        TransactionLogger::setFilePath(
+            blockerPath + "/transactions.csv"
+        );
+
+        Transaction failedCreation =
+            reliabilityEngine.createTransaction(
+                3000, "AED", "POS-LOG-FAIL-001"
+            );
+
+        assert(failedCreation.status == TransactionStatus::FAILED);
+
+        // Restore the test log and retry the same external reference.
+        TransactionLogger::setFilePath(testLog);
+
+        Transaction retryCreation =
+            reliabilityEngine.createTransaction(
+                3000, "AED", "POS-LOG-FAIL-001"
+            );
+
+        assert(retryCreation.status == TransactionStatus::CREATED);
+        assert(!retryCreation.transactionId.empty());
+
+        // Test 16: Failed status logging must not change transaction state.
+        TransactionLogger::setFilePath(
+            blockerPath + "/transactions.csv"
+        );
+
+        bool updateResult =
+            reliabilityEngine.updateStatus(
+                retryCreation,
+                TransactionStatus::SENT
+            );
+
+        assert(!updateResult);
+        assert(retryCreation.status == TransactionStatus::CREATED);
+
+        // Restore logging and confirm the same update can now succeed.
+        TransactionLogger::setFilePath(testLog);
+
+        assert(
+            reliabilityEngine.updateStatus(
+                retryCreation,
+                TransactionStatus::SENT
+            )
+        );
+
+        assert(retryCreation.status == TransactionStatus::SENT);
+
+        std::filesystem::remove(blockerPath);
+    }
+
+    // Test 17: Concurrent duplicate transaction requests
+    {
+        TransactionEngine concurrentEngine;
+
+        const int threadCount = 20;
+        const std::string externalReference = "POS-CONCURRENT-001";
+
+        std::vector<Transaction> results(threadCount);
+        std::vector<std::thread> workers;
+
+        for (int i = 0; i < threadCount; ++i)
+        {
+            workers.emplace_back([&, i]()
+            {
+                results[i] = concurrentEngine.createTransaction(
+                    5000,
+                    "AED",
+                    externalReference
+                );
+            });
+        }
+
+        // Wait for all threads to finish.
+        for (auto& worker : workers)
+        {
+            worker.join();
+        }
+
+        // Every request must return the same transaction ID.
+        const std::string firstTransactionId =
+            results[0].transactionId;
+
+        assert(!firstTransactionId.empty());
+
+        for (const auto& result : results)
+        {
+            assert(result.status == TransactionStatus::CREATED);
+            assert(result.transactionId == firstTransactionId);
+        }
+
+        // Verify only one transaction record was created.
+        std::ifstream logFile(testLog);
+        std::string line;
+        int matchingRecords = 0;
+
+        while (std::getline(logFile, line))
+        {
+            if (line.find(externalReference) != std::string::npos)
+            {
+                ++matchingRecords;
+            }
+        }
+
+        assert(matchingRecords == 1);
+
+        std::cout << "Concurrent duplicate request test passed!"
+                  << std::endl;
+    }
+
+    // Test 23: CSV special characters and transaction recovery
+    {
+        TransactionLogger::setFilePath(testLog);
+
+        Transaction specialTransaction;
+
+        specialTransaction.transactionId = "PB-CSV-001";
+        specialTransaction.externalReference =
+            "POS-REF,\"SPECIAL\"\nSECOND-LINE";
+        specialTransaction.amountMinor = 15000;
+        specialTransaction.currency = "AED";
+        specialTransaction.status = TransactionStatus::CREATED;
+
+        assert(TransactionLogger::logTransaction(specialTransaction));
+
+        std::vector<Transaction> loaded =
+            TransactionLogger::loadTransactions();
+
+        bool foundSpecialTransaction = false;
+
+        for (const auto& item : loaded)
+        {
+            if (item.transactionId == specialTransaction.transactionId)
+            {
+                assert(
+                    item.externalReference ==
+                    specialTransaction.externalReference
+                );
+
+                foundSpecialTransaction = true;
+                break;
+            }
+        }
+
+        assert(foundSpecialTransaction);
+
+        std::cout << "CSV escaping and recovery test passed!"
+                  << std::endl;
+    }
+
     // Restore the normal application log path.
     TransactionLogger::resetFilePath();
 
     std::cout << "All TransactionEngine tests passed!" << std::endl;
     std::cout << "Duplicate transaction protection tests passed!" << std::endl;
     std::cout << "Transaction restart recovery test passed!" << std::endl;
+    std::cout << "Transaction logging failure tests passed!" << std::endl;
 
     return 0;
 }

@@ -47,6 +47,8 @@ Transaction TransactionEngine::createTransaction(
     const std::string& currency,
     const std::string& externalReference)
 {
+    std::lock_guard<std::mutex> lock(engineMutex);
+
     Transaction transaction;
 
     transaction.amountMinor = amountMinor;
@@ -102,12 +104,17 @@ Transaction TransactionEngine::createTransaction(
     transaction.transactionId = id.str();
     transaction.status = TransactionStatus::CREATED;
 
+    // Persist before registering the transaction in memory.
+    if (!TransactionLogger::logTransaction(transaction))
+    {
+        transaction.status = TransactionStatus::FAILED;
+        return transaction;
+    }
+
     transactionsByReference.emplace(
         externalReference,
         transaction
     );
-
-    TransactionLogger::logTransaction(transaction);
 
     return transaction;
 }
@@ -116,24 +123,48 @@ bool TransactionEngine::updateStatus(
     Transaction& transaction,
     TransactionStatus newStatus)
 {
-    if (transaction.transactionId.empty())
+    std::lock_guard<std::mutex> lock(engineMutex);
+
+    if (transaction.transactionId.empty() ||
+        transaction.externalReference.empty())
+    {
         return false;
+    }
 
-    if (!isValidTransition(transaction.status, newStatus))
-        return false;
-
-    transaction.status = newStatus;
-
+    // Find the authoritative transaction in engine memory.
     auto existing = transactionsByReference.find(
         transaction.externalReference
     );
 
-    if (existing != transactionsByReference.end())
+    if (existing == transactionsByReference.end())
+        return false;
+
+    const Transaction& storedTransaction = existing->second;
+
+    // Reject modified or mismatched transaction details.
+    if (transaction.transactionId != storedTransaction.transactionId ||
+        transaction.amountMinor != storedTransaction.amountMinor ||
+        transaction.currency != storedTransaction.currency ||
+        transaction.status != storedTransaction.status)
     {
-        existing->second = transaction;
+        return false;
     }
 
-    TransactionLogger::logTransaction(transaction);
+    // Validate transition against the stored status.
+    if (!isValidTransition(storedTransaction.status, newStatus))
+        return false;
+
+    Transaction updatedTransaction = storedTransaction;
+    updatedTransaction.status = newStatus;
+
+    // Persist before changing the in-memory record.
+    if (!TransactionLogger::logTransaction(updatedTransaction))
+        return false;
+
+    existing->second = updatedTransaction;
+
+    // Synchronize the caller's transaction object.
+    transaction = updatedTransaction;
 
     return true;
 }
