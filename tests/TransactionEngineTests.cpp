@@ -425,6 +425,66 @@ int main()
         std::filesystem::remove(malformedLog);
     }
 
+    // Test 25: Incomplete quoted CSV record at EOF
+    {
+        const std::string incompleteLog =
+            "transaction_engine_incomplete_tests.csv";
+
+        TransactionLogger::setFilePath(incompleteLog);
+
+        std::filesystem::remove(incompleteLog);
+
+        {
+            std::ofstream file(incompleteLog, std::ios::binary);
+
+            assert(file.is_open());
+
+            file
+                << "TransactionID,ExternalReference,AmountMinor,"
+                << "Currency,Status,Timestamp,Environment\n";
+
+            // Valid transaction before the damaged record
+            file
+                << "PB-VALID-EOF-001,POS-VALID-EOF-001,5000,"
+                << "AED,CREATED,2026-11-24,SIMULATION\n";
+
+            // Damaged transaction: closing quotation mark is missing
+            file
+                << "PB-INCOMPLETE-001,\"POS-INCOMPLETE-001,6000,"
+                << "AED,CREATED,2026-11-24,SIMULATION";
+        }
+
+        // Load transactions from the incomplete CSV file.
+        std::vector<Transaction> recovered =
+            TransactionLogger::loadTransactions();
+
+        // Only the valid transaction should be recovered.
+        assert(recovered.size() == 1);
+
+        assert(
+            recovered[0].transactionId == "PB-VALID-EOF-001"
+        );
+
+        assert(
+            recovered[0].externalReference == "POS-VALID-EOF-001"
+        );
+
+        assert(recovered[0].amountMinor == 5000);
+        assert(recovered[0].currency == "AED");
+
+        assert(
+            recovered[0].status == TransactionStatus::CREATED
+        );
+
+        std::cout
+            << "Incomplete CSV EOF recovery test passed!"
+            << std::endl;
+
+        TransactionLogger::setFilePath(testLog);
+
+        std::filesystem::remove(incompleteLog);
+    }
+
     // Restore the normal application log path.
     TransactionLogger::resetFilePath();
 
