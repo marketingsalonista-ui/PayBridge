@@ -1,5 +1,4 @@
-﻿
-#include "TransactionLogger.h"
+﻿#include "TransactionLogger.h"
 
 #include <filesystem>
 #include <fstream>
@@ -311,7 +310,8 @@ bool TransactionLogger::logTransaction(
         {
             file
                 << "TransactionID,ExternalReference,AmountMinor,"
-                << "Currency,Status,Timestamp,Environment\n";
+                << "Currency,Status,Timestamp,Environment,AssetType,AssetCode,"
+                << "AssetNetwork,ContractAddress,DecimalPrecision\n";
         }
 
         file
@@ -325,7 +325,14 @@ bool TransactionLogger::logTransaction(
                 )
             ) << ","
             << escapeCsvField(getTimestamp()) << ","
-            << escapeCsvField("SIMULATION")
+            << escapeCsvField("SIMULATION") << ","
+            << escapeCsvField(
+                paybridge::assets::assetTypeToString(transaction.asset.type)
+            ) << ","
+            << escapeCsvField(transaction.asset.code) << ","
+            << escapeCsvField(transaction.asset.network) << ","
+            << escapeCsvField(transaction.asset.contractAddress) << ","
+            << static_cast<unsigned int>(transaction.money.precision)
             << "\n";
 
         file.close();
@@ -417,12 +424,12 @@ std::vector<Transaction> TransactionLogger::loadTransactions()
                 continue;
             }
 
-            if (fields.size() != 7)
+            if (fields.size() != 7 && fields.size() != 12)
             {
                 std::cerr
                     << "[WARNING] Skipping CSV record "
                     << recordNumber
-                    << ": expected 7 columns, found "
+                    << ": expected 7 or 12 columns, found "
                     << fields.size() << ".\n";
 
                 continue;
@@ -438,14 +445,25 @@ std::vector<Transaction> TransactionLogger::loadTransactions()
             const std::string& status = fields[4];
 
             if (transaction.transactionId.empty() ||
-                transaction.externalReference.empty() ||
-                transaction.currency.size() != 3)
+                transaction.externalReference.empty())
             {
                 std::cerr
                     << "[WARNING] Invalid transaction at CSV record "
                     << recordNumber << ".\n";
 
                 continue;
+            }
+
+            if (fields.size() == 7)
+            {
+                if (transaction.currency.size() != 3)
+                {
+                    std::cerr
+                        << "[WARNING] Invalid transaction at CSV record "
+                        << recordNumber << ".\n";
+
+                    continue;
+                }
             }
 
             try
@@ -471,6 +489,67 @@ std::vector<Transaction> TransactionLogger::loadTransactions()
             }
 
             transaction.status = stringToStatus(status);
+
+            if (fields.size() == 12)
+            {
+                bool validAssetType = false;
+
+                if (fields[7] == "FIAT")
+                {
+                    transaction.asset.type = paybridge::assets::AssetType::FIAT;
+                    validAssetType = true;
+
+                    if (transaction.asset.code.empty())
+                        transaction.asset.code = transaction.currency;
+                }
+                else if (fields[7] == "DIGITAL_ASSET")
+                {
+                    transaction.asset.type = paybridge::assets::AssetType::DIGITAL_ASSET;
+                    validAssetType = true;
+                }
+
+                if (!validAssetType)
+                    continue;
+
+                transaction.asset.code = fields[8];
+                transaction.asset.network = fields[9];
+                transaction.asset.contractAddress = fields[10];
+
+                try
+                {
+                    std::size_t parsedPrecision = 0;
+                    const unsigned long precision =
+                        std::stoul(fields[11], &parsedPrecision);
+
+                    if (parsedPrecision != fields[11].size() || precision > 18)
+                        throw std::invalid_argument("Invalid precision");
+
+                    transaction.asset.decimalPrecision =
+                        static_cast<std::uint8_t>(precision);
+                    transaction.money.precision =
+                        static_cast<std::uint8_t>(precision);
+                    transaction.money.units = transaction.amountMinor;
+
+                    if (!transaction.asset.isComplete())
+                        continue;
+
+                    if (transaction.asset.isFiat() &&
+                        transaction.asset.code != transaction.currency)
+                        continue;
+
+                    if (transaction.asset.isFiat() &&
+                        transaction.asset.network.empty() == false)
+                        continue;
+
+                    if (transaction.asset.isFiat() &&
+                        transaction.asset.contractAddress.empty() == false)
+                        continue;
+                }
+                catch (...)
+                {
+                    continue;
+                }
+            }
 
             if (transaction.status == TransactionStatus::INVALID)
             {

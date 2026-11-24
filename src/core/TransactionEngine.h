@@ -1,7 +1,11 @@
-﻿
-#pragma once
+﻿#pragma once
+
+#include "../assets/Asset.h"
+#include "../assets/AssetRegistry.h"
+#include "../money/Money.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <mutex>
@@ -24,6 +28,10 @@ struct Transaction
     std::int64_t amountMinor = 0;
     std::string currency;
     TransactionStatus status = TransactionStatus::INVALID;
+
+    // Complete asset identity and exact-money representation.
+    paybridge::assets::Asset asset;
+    paybridge::money::Money money;
 };
 
 class TransactionEngine
@@ -31,9 +39,17 @@ class TransactionEngine
 public:
     TransactionEngine();
 
+    // Backward-compatible fiat API.
     Transaction createTransaction(
         std::int64_t amountMinor,
         const std::string& currency,
+        const std::string& externalReference
+    );
+
+    // Asset-aware exact-money API.
+    Transaction createTransaction(
+        const paybridge::money::Money& money,
+        const paybridge::assets::Asset& asset,
         const std::string& externalReference
     );
 
@@ -43,6 +59,8 @@ public:
     );
 
     static std::string statusToString(TransactionStatus status);
+
+    paybridge::assets::AssetRegistry& assets();
 
 private:
     bool validateTransaction(
@@ -61,4 +79,6 @@ private:
     std::unordered_map<std::string, Transaction> transactionsByReference;
 
     void restoreTransactions();
+
+    paybridge::assets::AssetRegistry assetRegistry;
 };

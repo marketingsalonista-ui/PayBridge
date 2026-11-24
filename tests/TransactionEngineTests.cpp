@@ -1,6 +1,16 @@
+#include "../src/assets/AssetRegistry.h"
+#include "../src/money/AmountParser.h"
 
 #include "../src/core/TransactionEngine.h"
 #include "../src/core/TransactionLogger.h"
+
+#include "../src/protocol/JsonHandler.h"
+#include "../src/transports/TcpTransport.h"
+#include "../src/transports/SerialTransport.h"
+#include "../src/terminal/TerminalModel.h"
+#include "../src/terminal/TerminalManager.h"
+#include "../src/terminal/SimulatedTerminalTransport.h"
+#include "../src/terminal/SimulatedTerminalProtocol.h"
 
 #include <iostream>
 #include <cassert>
@@ -8,10 +18,46 @@
 #include <fstream>
 #include <thread>
 #include <vector>
+#include <memory>
 #include <string>
 
 int main()
 {
+    paybridge::assets::AssetRegistry registry;
+
+    const auto usd = registry.findFiat("USD");
+    assert(usd && usd->decimalPrecision == 2);
+
+    const auto jpy = registry.findFiat("JPY");
+    assert(jpy && jpy->decimalPrecision == 0);
+
+    const auto kwd = registry.findFiat("KWD");
+    assert(kwd && kwd->decimalPrecision == 3);
+
+    const auto parsedUsd = paybridge::money::parseAmount("125.50", 2);
+    assert(parsedUsd.success());
+    assert(parsedUsd.money.units == 12550);
+    assert(paybridge::money::formatAmount(parsedUsd.money) == "125.50");
+
+    assert(!paybridge::money::parseAmount("125.501", 2).success());
+    assert(!paybridge::money::parseAmount("-1.00", 2).success());
+    assert(!paybridge::money::parseAmount("0.00", 2).success());
+    assert(!paybridge::money::parseAmount("abc", 2).success());
+
+    assert(registry.registerUsdt("TRON_TESTNET", "CONFIGURED_TEST_CONTRACT", 6));
+    const auto usdt = registry.resolveDigitalAsset(
+        "USDT",
+        "TRON_TESTNET",
+        "CONFIGURED_TEST_CONTRACT"
+    );
+    assert(usdt && usdt->decimalPrecision == 6);
+
+    assert(!registry.resolveDigitalAsset(
+        "USDT",
+        "UNCONFIGURED_NETWORK",
+        "UNCONFIGURED_CONTRACT"
+    ));
+
     const std::string testLog = "transaction_engine_tests.csv";
     const std::string blockerPath = "transaction_engine_log_blocker";
 
@@ -338,6 +384,16 @@ int main()
             "POS-REF,\"SPECIAL\"\nSECOND-LINE";
         specialTransaction.amountMinor = 15000;
         specialTransaction.currency = "AED";
+
+        // Supply complete asset metadata for the 12-column CSV format.
+        specialTransaction.asset.type =
+            paybridge::assets::AssetType::FIAT;
+        specialTransaction.asset.code = "AED";
+        specialTransaction.asset.decimalPrecision = 2;
+
+        specialTransaction.money.units = 15000;
+        specialTransaction.money.precision = 2;
+
         specialTransaction.status = TransactionStatus::CREATED;
 
         assert(TransactionLogger::logTransaction(specialTransaction));
@@ -363,8 +419,9 @@ int main()
 
         assert(foundSpecialTransaction);
 
-        std::cout << "CSV escaping and recovery test passed!"
-                  << std::endl;
+        std::cout
+            << "CSV escaping and recovery test passed!"
+            << std::endl;
     }
 
     // Test 24: Malformed CSV records must not affect valid records
@@ -485,6 +542,65 @@ int main()
         std::filesystem::remove(incompleteLog);
     }
 
+    // P0 regression: existing RECEIVED/APPROVED/DECLINED transactions must not
+    // attempt backward SENT/RECEIVED transitions when retried.
+    {
+        const std::string p0Log =
+            "transaction_engine_p0_regression_tests.csv";
+
+        // Isolate this test from application and previous test history.
+        TransactionLogger::setFilePath(p0Log);
+        std::filesystem::remove(p0Log);
+
+        {
+            TransactionEngine engine;
+
+            Transaction received =
+                engine.createTransaction(7000, "AED", "POS-P0-RECEIVED");
+
+            assert(received.status == TransactionStatus::CREATED);
+            assert(engine.updateStatus(received, TransactionStatus::SENT));
+            assert(engine.updateStatus(received, TransactionStatus::RECEIVED));
+
+            Transaction duplicateReceived =
+                engine.createTransaction(7000, "AED", "POS-P0-RECEIVED");
+
+            assert(duplicateReceived.status == TransactionStatus::RECEIVED);
+            assert(!engine.updateStatus(duplicateReceived, TransactionStatus::SENT));
+
+            Transaction approved =
+                engine.createTransaction(8000, "AED", "POS-P0-APPROVED");
+
+            assert(approved.status == TransactionStatus::CREATED);
+            assert(engine.updateStatus(approved, TransactionStatus::SENT));
+            assert(engine.updateStatus(approved, TransactionStatus::RECEIVED));
+            assert(engine.updateStatus(approved, TransactionStatus::APPROVED));
+
+            Transaction duplicateApproved =
+                engine.createTransaction(8000, "AED", "POS-P0-APPROVED");
+
+            assert(duplicateApproved.status == TransactionStatus::APPROVED);
+            assert(!engine.updateStatus(duplicateApproved, TransactionStatus::RECEIVED));
+
+            Transaction declined =
+                engine.createTransaction(9000, "AED", "POS-P0-DECLINED");
+
+            assert(declined.status == TransactionStatus::CREATED);
+            assert(engine.updateStatus(declined, TransactionStatus::SENT));
+            assert(engine.updateStatus(declined, TransactionStatus::RECEIVED));
+            assert(engine.updateStatus(declined, TransactionStatus::DECLINED));
+
+            Transaction duplicateDeclined =
+                engine.createTransaction(9000, "AED", "POS-P0-DECLINED");
+
+            assert(duplicateDeclined.status == TransactionStatus::DECLINED);
+            assert(!engine.updateStatus(duplicateDeclined, TransactionStatus::RECEIVED));
+        }
+
+        // Remove only the dedicated P0 test log.
+        std::filesystem::remove(p0Log);
+        TransactionLogger::resetFilePath();
+    }
     // Restore the normal application log path.
     TransactionLogger::resetFilePath();
 
@@ -492,6 +608,130 @@ int main()
     std::cout << "Duplicate transaction protection tests passed!" << std::endl;
     std::cout << "Transaction restart recovery test passed!" << std::endl;
     std::cout << "Transaction logging failure tests passed!" << std::endl;
+
+    // Terminal transport foundation regressions.
+    {
+        using namespace paybridge::terminal;
+        using namespace paybridge::transport;
+
+        SimulatedTerminalTransport approved(SimulatedTerminalOutcome::APPROVED);
+        assert(approved.open().success);
+
+        const std::vector<std::uint8_t> request = {'S', 'I', 'M'};
+        assert(approved.send(request).success);
+
+        TransportBytes approvedResponse = approved.receive(128);
+        assert(approvedResponse.result.success);
+
+        SimulatedTerminalProtocol protocol;
+        assert(protocol.validateRequest("VX680-DEMO-001", "POS-SIM-001", request));
+        assert(protocol.validateResponse(approvedResponse.data));
+
+        SimulatedTerminalResponse parsed =
+            protocol.parseResponse(approvedResponse.data, "VX680-DEMO-001");
+        assert(parsed.outcome == SimulatedTerminalOutcome::APPROVED);
+        assert(parsed.simulatedResult.find("SIMULATED") != std::string::npos);
+        approved.close();
+        assert(!approved.isOpen());
+
+        SimulatedTerminalTransport declined(SimulatedTerminalOutcome::DECLINED);
+        assert(declined.open().success);
+        assert(declined.send(request).success);
+        TransportBytes declinedResponse = declined.receive(128);
+        assert(declinedResponse.result.success);
+        assert(protocol.validateResponse(declinedResponse.data));
+        parsed = protocol.parseResponse(declinedResponse.data, "VX680-DEMO-001");
+        assert(parsed.outcome == SimulatedTerminalOutcome::DECLINED);
+        declined.close();
+
+        SimulatedTerminalTransport timeout(SimulatedTerminalOutcome::TIMEOUT);
+        timeout.setReceiveTimeoutMilliseconds(50);
+        assert(timeout.open().success);
+        assert(timeout.send(request).success);
+        TransportBytes timeoutResponse = timeout.receive(128);
+        assert(!timeoutResponse.result.success);
+        assert(timeoutResponse.result.error == TransportError::TIMEOUT);
+        timeout.close();
+
+        SimulatedTerminalTransport disconnected(SimulatedTerminalOutcome::DISCONNECTED);
+        assert(!disconnected.open().success);
+
+        SimulatedTerminalTransport malformed(SimulatedTerminalOutcome::MALFORMED);
+        assert(malformed.open().success);
+        assert(malformed.send(request).success);
+        TransportBytes malformedResponse = malformed.receive(128);
+        assert(malformedResponse.result.success);
+        assert(!protocol.validateResponse(malformedResponse.data));
+        parsed = protocol.parseResponse(malformedResponse.data, "VX680-DEMO-001");
+        assert(parsed.outcome == SimulatedTerminalOutcome::MALFORMED);
+        malformed.close();
+
+        assert(!protocol.validateRequest("", "POS-SIM", request));
+        assert(!protocol.validateRequest("VX680-DEMO-001", "", request));
+        assert(!protocol.validateRequest("VX680-DEMO-001", "POS-SIM", {}));
+
+        TerminalManager terminalManager;
+
+        TerminalModel first;
+        first.terminalId = "VX680-DEMO-001";
+        first.transportKind = TransportKind::SIMULATED;
+
+        TerminalModel second;
+        second.terminalId = "VX680-DEMO-002";
+        second.transportKind = TransportKind::SIMULATED;
+
+        terminalManager.registerTerminal(first);
+        terminalManager.registerTerminal(second);
+
+        assert(terminalManager.containsTerminal("VX680-DEMO-001"));
+        assert(terminalManager.containsTerminal("VX680-DEMO-002"));
+        assert(terminalManager.terminals().size() == 2);
+
+        terminalManager.setTransport(
+            "VX680-DEMO-001",
+            std::make_unique<SimulatedTerminalTransport>(
+                SimulatedTerminalOutcome::APPROVED
+            )
+        );
+
+        assert(terminalManager.connect("VX680-DEMO-001").success);
+
+        TransportBytes managerResponse = terminalManager.sendAndReceive(
+            "VX680-DEMO-001",
+            request,
+            128
+        );
+        assert(managerResponse.result.success);
+        assert(protocol.validateResponse(managerResponse.data));
+
+        terminalManager.disconnect("VX680-DEMO-001");
+        assert(!terminalManager.sendAndReceive(
+            "VX680-DEMO-001",
+            request,
+            128
+        ).result.success);
+
+        assert(terminalManager.removeTerminal("VX680-DEMO-001"));
+        assert(!terminalManager.containsTerminal("VX680-DEMO-001"));
+
+        TcpTransport tcpInvalid("not-an-ipv4-address", 5050);
+        assert(tcpInvalid.open().error == TransportError::INVALID_ARGUMENT);
+        assert(!tcpInvalid.isOpen());
+
+        SerialTransport serialInvalid("COM_DOES_NOT_EXIST", 115200);
+        assert(!serialInvalid.open().success);
+        assert(!serialInvalid.isOpen());
+
+        TransportBytes tcpReceiveClosed = tcpInvalid.receive(128);
+        assert(!tcpReceiveClosed.result.success);
+        assert(tcpReceiveClosed.result.error == TransportError::NOT_OPEN);
+
+        TransportBytes serialReceiveClosed = serialInvalid.receive(128);
+        assert(!serialReceiveClosed.result.success);
+        assert(serialReceiveClosed.result.error == TransportError::NOT_OPEN);
+
+        std::cout << "Terminal transport foundation tests passed!" << std::endl;
+    }
 
     return 0;
 }

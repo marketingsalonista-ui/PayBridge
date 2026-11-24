@@ -1,12 +1,14 @@
 ﻿#include <iostream>
 #include <string>
-#include <iomanip>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <cctype>
 
 #include "../core/TransactionEngine.h"
-#include "../protocol/JsonHandler.h"
 #include "../core/TransactionLogger.h"
+#include "../protocol/JsonHandler.h"
+#include "../money/AmountParser.h"
+#include "../assets/AssetRegistry.h"
 
 int main()
 {
@@ -14,24 +16,89 @@ int main()
     std::cout << "       PAYBRIDGE POS SIMULATOR      \n";
     std::cout << "====================================\n";
 
-    double amount = 0;
+    std::string assetType;
+    std::string assetCode;
 
-    std::cout << "\nEnter payment amount (AED): ";
-    std::cin >> amount;
+    std::cout << "\nAsset type (FIAT/DIGITAL_ASSET): ";
+    std::cin >> assetType;
+    std::cout << "Asset code: ";
+    std::cin >> assetCode;
 
-    if (!std::cin || amount <= 0 || amount > 10000000)
+    for (char& character : assetCode)
+        character = static_cast<char>(std::toupper(static_cast<unsigned char>(character)));
+
+    TransactionEngine engine;
+    paybridge::assets::Asset asset;
+
+    if (assetType == "FIAT")
     {
-        std::cout << "[ERROR] Invalid amount.\n";
+        const auto registered = engine.assets().findFiat(assetCode);
+        if (!registered)
+        {
+            std::cout << "[ERROR] Unsupported fiat asset.\n";
+            return 1;
+        }
+        asset = *registered;
+    }
+    else if (assetType == "DIGITAL_ASSET")
+    {
+        std::string network;
+        std::string contractAddress;
+
+        std::cout << "Network: ";
+        std::cin >> network;
+        std::cout << "Contract address: ";
+        std::cin >> contractAddress;
+
+        const auto registered = engine.assets().resolveDigitalAsset(
+            assetCode,
+            network,
+            contractAddress
+        );
+
+        if (!registered)
+        {
+            std::cout << "[ERROR] Unsupported or untrusted digital asset identity.\n";
+            return 1;
+        }
+        asset = *registered;
+    }
+    else
+    {
+        std::cout << "[ERROR] Invalid asset type.\n";
         return 1;
     }
 
-    long long amountMinor =
-        static_cast<long long>(amount * 100 + 0.5);
+    std::string amountText;
+    std::cout << "Amount (decimal): ";
+    std::cin >> amountText;
 
-    TransactionEngine engine;
+    const auto parsed = paybridge::money::parseAmount(
+        amountText,
+        asset.decimalPrecision
+    );
 
-    Transaction transaction =
-         engine.createTransaction(amountMinor, "AED", "POS-TEST-0001");
+    if (!parsed.success())
+    {
+        std::cout << "[ERROR] Invalid exact monetary amount.\n";
+        return 1;
+    }
+
+    std::string externalReference;
+    std::cout << "External reference: ";
+    std::cin >> externalReference;
+
+    if (externalReference.empty())
+    {
+        std::cout << "[ERROR] External reference is required.\n";
+        return 1;
+    }
+
+    Transaction transaction = engine.createTransaction(
+        parsed.money,
+        asset,
+        externalReference
+    );
 
     if (transaction.status != TransactionStatus::CREATED)
     {
@@ -39,101 +106,73 @@ int main()
         return 1;
     }
 
-    auto showStatus = [&transaction]()
-    {
-        std::cout << "[STATUS] "
-                  << TransactionEngine::statusToString(
-                         transaction.status)
-                  << "\n";
-    };
-
-    std::cout << "\n[CREATED] Transaction: "
-              << transaction.transactionId << "\n";
-
-    showStatus();
-
     WSADATA wsaData{};
-
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
     {
         engine.updateStatus(transaction, TransactionStatus::FAILED);
-        showStatus();
         return 1;
     }
 
-    SOCKET clientSocket =
-        socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-
+    SOCKET clientSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (clientSocket == INVALID_SOCKET)
     {
-        std::cout << "[ERROR] Socket creation failed.\n";
         engine.updateStatus(transaction, TransactionStatus::FAILED);
-        showStatus();
         WSACleanup();
+        std::cout << "[ERROR] Socket creation failed.\n";
         return 1;
     }
 
     sockaddr_in serverAddress{};
-
     serverAddress.sin_family = AF_INET;
     serverAddress.sin_port = htons(5050);
     inet_pton(AF_INET, "127.0.0.1", &serverAddress.sin_addr);
 
-    std::cout << "[CONNECTING] PayBridge server...\n";
-
-    if (connect(
-        clientSocket,
-        reinterpret_cast<sockaddr*>(&serverAddress),
-        sizeof(serverAddress)
-    ) == SOCKET_ERROR)
+    if (connect(clientSocket, reinterpret_cast<sockaddr*>(&serverAddress), sizeof(serverAddress)) == SOCKET_ERROR)
     {
-        std::cout << "[ERROR] Server connection failed.\n";
         engine.updateStatus(transaction, TransactionStatus::FAILED);
-        showStatus();
         closesocket(clientSocket);
         WSACleanup();
+        std::cout << "[ERROR] Server connection failed.\n";
         return 1;
     }
 
-    std::cout << "[CONNECTED] Successfully connected.\n";
+    DWORD timeout = 10000;
+    setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO,
+               reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+    setsockopt(clientSocket, SOL_SOCKET, SO_SNDTIMEO,
+               reinterpret_cast<const char*>(&timeout), sizeof(timeout));
 
-    std::string request =
-        JsonHandler::createPaymentRequest(
-            transaction.transactionId,
-            amountMinor,
-            "AED"
-        );
-
+    std::string request = JsonHandler::createPaymentRequest(
+        transaction.transactionId,
+        externalReference,
+        asset,
+        parsed.money
+    );
     request += "\n";
 
-    int sent = 0;
-
-    while (sent < static_cast<int>(request.size()))
+    std::size_t sent = 0;
+    while (sent < request.size())
     {
-        int result = send(
+        const int result = send(
             clientSocket,
             request.c_str() + sent,
-            static_cast<int>(request.size()) - sent,
+            static_cast<int>(request.size() - sent),
             0
         );
 
         if (result == SOCKET_ERROR || result == 0)
         {
-            std::cout << "[ERROR] Request transmission failed.\n";
             engine.updateStatus(transaction, TransactionStatus::FAILED);
-            showStatus();
             closesocket(clientSocket);
             WSACleanup();
+            std::cout << "[ERROR] Request transmission failed.\n";
             return 1;
         }
 
-        sent += result;
+        sent += static_cast<std::size_t>(result);
     }
 
     engine.updateStatus(transaction, TransactionStatus::SENT);
-
-    std::cout << "[SENT] Payment request transmitted.\n";
-    showStatus();
 
     std::string response;
     char buffer[1024];
@@ -141,20 +180,12 @@ int main()
 
     while (response.size() <= 65536)
     {
-        int received = recv(
-            clientSocket,
-            buffer,
-            sizeof(buffer),
-            0
-        );
-
+        const int received = recv(clientSocket, buffer, sizeof(buffer), 0);
         if (received <= 0)
             break;
 
         response.append(buffer, received);
-
-        std::size_t newline = response.find('\n');
-
+        const std::size_t newline = response.find('\n');
         if (newline != std::string::npos)
         {
             response.resize(newline);
@@ -168,53 +199,36 @@ int main()
 
     if (!complete)
     {
-        std::cout << "[ERROR] Incomplete or missing response.\n";
         engine.updateStatus(transaction, TransactionStatus::FAILED);
-        showStatus();
+        std::cout << "[ERROR] Incomplete or missing response.\n";
         return 1;
     }
 
     try
     {
-        auto data = JsonHandler::parseMessage(response);
+        const auto data = JsonHandler::parseMessage(response);
 
-        bool validResponse =
-            data.is_object()
-            && data.value("message_type", "") == "PAYMENT_RESPONSE"
-            && data.value("transaction_id", "") == transaction.transactionId
-            && data.contains("status")
-            && data["status"].is_string();
-
-        if (!validResponse)
+        if (!data.is_object() ||
+            data.value("message_type", "") != "PAYMENT_RESPONSE" ||
+            data.value("status", "") == "")
         {
-            std::cout << "[ERROR] Invalid payment response.\n";
             engine.updateStatus(transaction, TransactionStatus::FAILED);
-            showStatus();
+            std::cout << "[ERROR] Invalid payment response.\n";
             return 1;
         }
 
         std::cout << "\nPAYBRIDGE RESPONSE:\n";
         std::cout << data.dump(4) << "\n";
 
-        std::string responseStatus = data["status"];
-
-        if (responseStatus == "RECEIVED")
+        if (data["status"] == "RECEIVED")
         {
-            engine.updateStatus(
-                transaction,
-                TransactionStatus::RECEIVED
-            );
-
-            std::cout << "\n[CONFIRMED] Server received the request.\n";
+            engine.updateStatus(transaction, TransactionStatus::RECEIVED);
+            std::cout << "[CONFIRMED] Server received the request.\n";
         }
         else
         {
-            engine.updateStatus(
-                transaction,
-                TransactionStatus::FAILED
-            );
-
-            std::cout << "\n[FAILED] Server rejected the request.\n";
+            engine.updateStatus(transaction, TransactionStatus::FAILED);
+            std::cout << "[FAILED] Server rejected the request.\n";
         }
     }
     catch (...)
@@ -222,29 +236,17 @@ int main()
         engine.updateStatus(transaction, TransactionStatus::FAILED);
         std::cout << "[ERROR] Could not parse server response.\n";
     }
-    TransactionLogger::logTransaction(transaction);
-std::cout << "\n========== TRANSACTION SUMMARY ==========\n";
 
-    std::cout << "Transaction ID : "
-              << transaction.transactionId << "\n";
-
-    std::cout << "Amount         : AED "
-              << std::fixed << std::setprecision(2)
-              << amountMinor / 100.0 << "\n";
-
-    std::cout << "Currency       : AED\n";
-
+    std::cout << "\n========== TRANSACTION SUMMARY ==========" << "\n";
+    std::cout << "Transaction ID : " << transaction.transactionId << "\n";
+    std::cout << "External Ref   : " << externalReference << "\n";
+    std::cout << "Asset          : " << asset.identityKey() << "\n";
+    std::cout << "Amount         : "
+              << paybridge::money::formatAmount(parsed.money) << "\n";
     std::cout << "Final Status   : "
-              << TransactionEngine::statusToString(
-                     transaction.status)
-              << "\n";
-
+              << TransactionEngine::statusToString(transaction.status) << "\n";
     std::cout << "=========================================\n";
-
-    if (transaction.status == TransactionStatus::RECEIVED)
-        std::cout << "Note: Receipt confirmed, not payment approval.\n";
-
-    std::cout << "\n[COMPLETE] Simulator finished.\n";
+    std::cout << "Note: Receipt confirmed, not payment approval.\n";
 
     return 0;
 }

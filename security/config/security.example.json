@@ -1,0 +1,21 @@
+{
+  "network": {
+    "mode": "localhost",
+    "bind_address": "127.0.0.1",
+    "port": 5050,
+    "allow_lan": false
+  },
+  "security": {
+    "tls_enabled": false,
+    "mutual_tls_required": true,
+    "authentication_required": true,
+    "max_connections": 10,
+    "max_message_size": 65536,
+    "receive_timeout_seconds": 10,
+    "send_timeout_seconds": 10
+  },
+  "devices": {
+    "allowed_ips": [],
+    "require_registration": true
+  }
+}

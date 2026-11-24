@@ -1,6 +1,7 @@
-﻿
-#include "TransactionEngine.h"
+﻿#include "TransactionEngine.h"
 #include "TransactionLogger.h"
+
+#include "../money/AmountParser.h"
 
 #include <iomanip>
 #include <sstream>
@@ -11,15 +12,34 @@ TransactionEngine::TransactionEngine()
     restoreTransactions();
 }
 
+paybridge::assets::AssetRegistry& TransactionEngine::assets()
+{
+    return assetRegistry;
+}
+
 void TransactionEngine::restoreTransactions()
 {
     const auto savedTransactions =
         TransactionLogger::loadTransactions();
 
-    for (const auto& transaction : savedTransactions)
+    for (Transaction transaction : savedTransactions)
     {
-        transactionsByReference[transaction.externalReference] =
-            transaction;
+        if (transaction.asset.isComplete() &&
+            assetRegistry.contains(transaction.asset))
+        {
+            transactionsByReference[transaction.externalReference] = transaction;
+            continue;
+        }
+
+        const auto fiat = assetRegistry.findFiat(transaction.currency);
+        if (fiat)
+        {
+            transaction.asset = *fiat;
+            transaction.money.units = transaction.amountMinor;
+            transaction.money.precision = fiat->decimalPrecision;
+
+            transactionsByReference[transaction.externalReference] = transaction;
+        }
     }
 }
 
@@ -47,16 +67,39 @@ Transaction TransactionEngine::createTransaction(
     const std::string& currency,
     const std::string& externalReference)
 {
+    const auto fiat = assetRegistry.findFiat(currency);
+    if (!fiat)
+        return Transaction{.externalReference = externalReference,
+                           .amountMinor = amountMinor,
+                           .currency = currency,
+                           .status = TransactionStatus::INVALID};
+
+    paybridge::money::Money money;
+    money.units = amountMinor;
+    money.precision = fiat->decimalPrecision;
+
+    return createTransaction(money, *fiat, externalReference);
+}
+
+Transaction TransactionEngine::createTransaction(
+    const paybridge::money::Money& money,
+    const paybridge::assets::Asset& asset,
+    const std::string& externalReference)
+{
     std::lock_guard<std::mutex> lock(engineMutex);
 
     Transaction transaction;
-
-    transaction.amountMinor = amountMinor;
-    transaction.currency = currency;
+    transaction.amountMinor = money.units;
+    transaction.currency = asset.isFiat() ? asset.code : std::string{};
     transaction.externalReference = externalReference;
+    transaction.asset = asset;
+    transaction.money = money;
 
-    if (!validateTransaction(amountMinor, currency) ||
-        externalReference.empty())
+    if (!money.isPositive() ||
+        externalReference.empty() ||
+        !asset.isComplete() ||
+        !assetRegistry.contains(asset) ||
+        money.precision != asset.decimalPrecision)
     {
         transaction.status = TransactionStatus::INVALID;
         return transaction;
@@ -68,8 +111,8 @@ Transaction TransactionEngine::createTransaction(
     {
         const Transaction& previous = existing->second;
 
-        if (previous.amountMinor != amountMinor ||
-            previous.currency != currency)
+        if (previous.money.units != money.units ||
+            previous.asset != asset)
         {
             transaction.status = TransactionStatus::INVALID;
             return transaction;
@@ -104,18 +147,13 @@ Transaction TransactionEngine::createTransaction(
     transaction.transactionId = id.str();
     transaction.status = TransactionStatus::CREATED;
 
-    // Persist before registering the transaction in memory.
     if (!TransactionLogger::logTransaction(transaction))
     {
         transaction.status = TransactionStatus::FAILED;
         return transaction;
     }
 
-    transactionsByReference.emplace(
-        externalReference,
-        transaction
-    );
-
+    transactionsByReference.emplace(externalReference, transaction);
     return transaction;
 }
 
@@ -145,6 +183,9 @@ bool TransactionEngine::updateStatus(
     if (transaction.transactionId != storedTransaction.transactionId ||
         transaction.amountMinor != storedTransaction.amountMinor ||
         transaction.currency != storedTransaction.currency ||
+        transaction.money.units != storedTransaction.money.units ||
+        transaction.money.precision != storedTransaction.money.precision ||
+        transaction.asset != storedTransaction.asset ||
         transaction.status != storedTransaction.status)
     {
         return false;

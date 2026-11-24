@@ -7,3 +7,18 @@
 *.pdb
 logs/*.csv
 .vs/
+
+# Generated CMake files
+CMakeFiles/
+
+# Frontend dependencies and build output
+frontend/node_modules/
+frontend/dist/
+
+# Local environment and private credentials
+.env
+.env.*
+!.env.example
+*.key
+*.p12
+*.pfx

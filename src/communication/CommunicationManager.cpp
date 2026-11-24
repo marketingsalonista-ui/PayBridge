@@ -1,5 +1,7 @@
 ﻿#include "CommunicationManager.h"
 #include "../protocol/JsonHandler.h"
+#include "../adapters/FiatAdapter.h"
+#include "../adapters/DigitalAssetAdapter.h"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -9,6 +11,11 @@
 #include <exception>
 
 #pragma comment(lib, "ws2_32.lib")
+
+CommunicationManager::CommunicationManager(TransactionEngine& engine)
+    : engine(engine)
+{
+}
 
 int CommunicationManager::runServer(unsigned short port)
 {
@@ -152,55 +159,123 @@ int CommunicationManager::runServer(unsigned short port)
         {
             response["message"] = "Request exceeds maximum size";
         }
-        else if (complete && JsonHandler::validateMessage(request))
+        else if (complete)
         {
-            try
+            const auto validation = JsonHandler::parseAndValidatePaymentRequest(
+                request,
+                engine.assets()
+            );
+
+            if (!validation.valid)
             {
-                auto data = JsonHandler::parseMessage(request);
+                response["error_code"] = validation.errorCode;
+                response["message"] = validation.message;
+                std::cout << "[REJECTED] " << validation.errorCode << "\n";
+            }
+            else
+            {
+                Transaction transaction = engine.createTransaction(
+                    validation.request.money,
+                    validation.request.asset,
+                    validation.request.externalReference
+                );
 
-                bool validPayment =
-                    data.value("message_type", "") == "PAYMENT_REQUEST"
-                    && !data["transaction_id"].get<std::string>().empty()
-                    && data.contains("payment")
-                    && data["payment"].is_object()
-                    && data["payment"].contains("amount_minor")
-                    && data["payment"]["amount_minor"].is_number_integer()
-                    && data["payment"]["amount_minor"].get<long long>() > 0
-                    && data["payment"].contains("currency")
-                    && data["payment"]["currency"].is_string()
-                    && data["payment"]["currency"].get<std::string>().size() == 3;
-
-                if (validPayment)
+                if (validation.request.transactionId.empty() == false)
                 {
-                    std::string transactionId =
-                        data["transaction_id"].get<std::string>();
+                    response["submitted_transaction_id"] =
+                        validation.request.transactionId;
+                }
 
-                    response["status"] = "RECEIVED";
-                    response["transaction_id"] = transactionId;
-                    response["message"] = "Request received by PayBridge";
-
-                    std::cout << "[RECEIVED] Payment request\n";
-                    std::cout << "[TRANSACTION] "
-                              << transactionId << "\n";
-                    std::cout << "[AMOUNT MINOR] "
-                              << data["payment"]["amount_minor"] << "\n";
+                if (transaction.status == TransactionStatus::INVALID ||
+                    transaction.status == TransactionStatus::FAILED)
+                {
+                    response["error_code"] = "TRANSACTION_REJECTED";
+                    response["message"] = "Transaction could not be created or retried safely";
                 }
                 else
                 {
-                    response["message"] = "Invalid payment request";
-                    std::cout << "[REJECTED] Invalid payment data\n";
+                    if (!validation.request.transactionId.empty() &&
+                        validation.request.transactionId != transaction.transactionId)
+                    {
+                        response["error_code"] = "TRANSACTION_ID_MISMATCH";
+                        response["message"] = "Submitted transaction_id conflicts with the authoritative transaction";
+                    }
+                    else
+                    {
+                        paybridge::adapters::FiatAdapter fiatAdapter;
+                        paybridge::adapters::DigitalAssetAdapter digitalAdapter;
+                        paybridge::adapters::PaymentAdapter* adapter = nullptr;
+
+                        if (transaction.asset.isFiat())
+                            adapter = &fiatAdapter;
+                        else if (transaction.asset.isDigitalAsset())
+                            adapter = &digitalAdapter;
+
+                        if (adapter == nullptr || !adapter->supports(transaction.asset))
+                        {
+                            response["error_code"] = "UNSUPPORTED_ASSET";
+                            response["message"] = "No supported payment adapter is configured for the asset";
+                        }
+                        else
+                        {
+                            if (transaction.status == TransactionStatus::RECEIVED ||
+                                transaction.status == TransactionStatus::APPROVED ||
+                                transaction.status == TransactionStatus::DECLINED)
+                            {
+                                response["status"] = "RECEIVED";
+                                response["transaction_id"] = transaction.transactionId;
+                                response["external_reference"] = transaction.externalReference;
+                                response["message"] =
+                                    "Existing transaction returned; no state transition applied";
+                                response["existing_status"] =
+                                    TransactionEngine::statusToString(transaction.status);
+
+                                std::cout << "[DUPLICATE] Existing transaction returned\n";
+                                std::cout << "[STATUS] "
+                                          << TransactionEngine::statusToString(transaction.status)
+                                          << "\n";
+                            }
+                            else
+                            {
+                                const auto adapterResult = adapter->simulate(
+                                    transaction.asset,
+                                    transaction.money,
+                                    transaction.externalReference
+                                );
+
+                                if (!adapterResult.accepted)
+                                {
+                                    response["error_code"] = "ADAPTER_REJECTED";
+                                    response["message"] = adapterResult.message;
+                                    engine.updateStatus(transaction, TransactionStatus::FAILED);
+                                }
+                                else
+                                {
+                                    if (!engine.updateStatus(transaction, TransactionStatus::SENT) ||
+                                        !engine.updateStatus(transaction, TransactionStatus::RECEIVED))
+                                    {
+                                        response["error_code"] = "PERSISTENCE_FAILURE";
+                                        response["message"] = "Transaction state could not be persisted before receipt";
+                                    }
+                                    else
+                                    {
+                                        response["status"] = "RECEIVED";
+                                        response["transaction_id"] = transaction.transactionId;
+                                        response["external_reference"] = transaction.externalReference;
+                                        response["message"] = adapterResult.message;
+
+                                        std::cout << "[RECEIVED] Payment request\n";
+                                        std::cout << "[TRANSACTION] "
+                                                  << transaction.transactionId << "\n";
+                                        std::cout << "[ASSET] "
+                                                  << transaction.asset.identityKey() << "\n";
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
-            catch (const std::exception& error)
-            {
-                response["message"] = "Request parsing failed";
-                std::cerr << "[ERROR] " << error.what() << "\n";
-            }
-        }
-        else
-        {
-            response["message"] = "Invalid or incomplete JSON message";
-            std::cout << "[REJECTED] Invalid or incomplete request\n";
         }
 
         std::string output = response.dump() + "\n";
