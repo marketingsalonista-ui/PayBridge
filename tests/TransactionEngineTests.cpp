@@ -367,6 +367,64 @@ int main()
                   << std::endl;
     }
 
+    // Test 24: Malformed CSV records must not affect valid records
+    {
+        const std::string malformedLog =
+            "transaction_engine_malformed_tests.csv";
+
+        TransactionLogger::setFilePath(malformedLog);
+
+        std::filesystem::remove(malformedLog);
+
+        {
+            std::ofstream file(malformedLog, std::ios::binary);
+
+            assert(file.is_open());
+
+            file
+                << "TransactionID,ExternalReference,AmountMinor,"
+                << "Currency,Status,Timestamp,Environment\n";
+
+            // Valid record 1
+            file
+                << "PB-VALID-001,POS-VALID-001,1000,"
+                << "AED,CREATED,2026-11-24,SIMULATION\n";
+
+            // Invalid record: only 5 columns
+            file
+                << "PB-BAD-001,POS-BAD-001,2000,AED,CREATED\n";
+
+            // Invalid record: non-numeric amount
+            file
+                << "PB-BAD-002,POS-BAD-002,INVALID,"
+                << "AED,CREATED,2026-11-24,SIMULATION\n";
+
+            // Valid record 2 after malformed records
+            file
+                << "PB-VALID-002,POS-VALID-002,3000,"
+                << "AED,APPROVED,2026-11-24,SIMULATION\n";
+        }
+
+        std::vector<Transaction> recovered =
+            TransactionLogger::loadTransactions();
+
+        assert(recovered.size() == 2);
+
+        assert(recovered[0].transactionId == "PB-VALID-001");
+        assert(recovered[0].amountMinor == 1000);
+
+        assert(recovered[1].transactionId == "PB-VALID-002");
+        assert(recovered[1].amountMinor == 3000);
+
+        std::cout
+            << "Malformed CSV recovery test passed!"
+            << std::endl;
+
+        TransactionLogger::setFilePath(testLog);
+
+        std::filesystem::remove(malformedLog);
+    }
+
     // Restore the normal application log path.
     TransactionLogger::resetFilePath();
 
