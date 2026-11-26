@@ -11,6 +11,7 @@
 #include <vector>
 #include <string>
 #include <stdexcept>
+#include <utility>
 
 namespace
 {
@@ -61,6 +62,7 @@ namespace
         if (status == "APPROVED") return TransactionStatus::APPROVED;
         if (status == "DECLINED") return TransactionStatus::DECLINED;
         if (status == "FAILED") return TransactionStatus::FAILED;
+        if (status == "UNKNOWN") return TransactionStatus::UNKNOWN;
 
         return TransactionStatus::INVALID;
     }
@@ -99,7 +101,7 @@ namespace
     }
 
     // Skip the remainder of a malformed physical line.
-    void skipToNextLine(std::istream& input)
+    void skipToNextLine(std::istream& input, std::string* rawRecord = nullptr)
     {
         char character;
 
@@ -107,8 +109,12 @@ namespace
         {
             if (character == '\n')
             {
+                if (rawRecord)
+                    rawRecord->push_back(character);
                 break;
             }
+            if (rawRecord)
+                rawRecord->push_back(character);
         }
     }
 
@@ -116,7 +122,8 @@ namespace
     // Newlines inside quoted fields are preserved.
     CsvReadResult readCsvRecord(
         std::istream& input,
-        std::vector<std::string>& fields)
+        std::vector<std::string>& fields,
+        std::string* rawRecord = nullptr)
     {
         fields.clear();
 
@@ -132,6 +139,8 @@ namespace
         while (input.get(character))
         {
             sawCharacter = true;
+            if (rawRecord)
+                rawRecord->push_back(character);
 
             if (insideQuotes)
             {
@@ -140,6 +149,8 @@ namespace
                     if (input.peek() == '"')
                     {
                         input.get(character);
+                        if (rawRecord)
+                            rawRecord->push_back(character);
                         field += '"';
                     }
                     else
@@ -174,13 +185,15 @@ namespace
                 else if (character == '\r' && input.peek() == '\n')
                 {
                     input.get(character);
+                    if (rawRecord)
+                        rawRecord->push_back(character);
                     fields.push_back(field);
 
                     return CsvReadResult::RECORD;
                 }
                 else
                 {
-                    skipToNextLine(input);
+                    skipToNextLine(input, rawRecord);
                     fields.clear();
 
                     return CsvReadResult::MALFORMED;
@@ -209,6 +222,8 @@ namespace
             else if (character == '\r' && input.peek() == '\n')
             {
                 input.get(character);
+                if (rawRecord)
+                    rawRecord->push_back(character);
                 fields.push_back(field);
 
                 return CsvReadResult::RECORD;
@@ -217,7 +232,7 @@ namespace
             {
                 if (fieldStarted || !field.empty())
                 {
-                    skipToNextLine(input);
+                    skipToNextLine(input, rawRecord);
                     fields.clear();
 
                     return CsvReadResult::MALFORMED;
@@ -253,6 +268,182 @@ namespace
 
         return CsvReadResult::RECORD;
     }
+
+    bool parseTransactionRecord(
+        const std::vector<std::string>& fields,
+        Transaction& transaction,
+        std::string& diagnostic)
+    {
+        if (fields.size() != 7 && fields.size() != 12)
+        {
+            diagnostic = "Expected 7 or 12 columns, found " +
+                         std::to_string(fields.size());
+            return false;
+        }
+
+        transaction.transactionId = fields[0];
+        transaction.externalReference = fields[1];
+        transaction.currency = fields[3];
+        if (transaction.transactionId.empty() || transaction.externalReference.empty())
+        {
+            diagnostic = "Transaction ID and external reference must be non-empty";
+            return false;
+        }
+
+        try
+        {
+            std::size_t parsed = 0;
+            transaction.amountMinor = std::stoll(fields[2], &parsed);
+            if (parsed != fields[2].size() || transaction.amountMinor <= 0)
+                throw std::invalid_argument("invalid amount");
+        }
+        catch (...)
+        {
+            diagnostic = "Amount is not a positive integer minor-unit value";
+            return false;
+        }
+
+        transaction.status = stringToStatus(fields[4]);
+        if (transaction.status == TransactionStatus::INVALID)
+        {
+            diagnostic = "Unrecognized or invalid transaction status";
+            return false;
+        }
+
+        if (fields.size() == 7)
+        {
+            if (transaction.currency.size() != 3)
+            {
+                diagnostic = "Legacy fiat currency must contain three characters";
+                return false;
+            }
+            transaction.asset.code = transaction.currency;
+            transaction.asset.type = paybridge::assets::AssetType::FIAT;
+            transaction.money.units = transaction.amountMinor;
+            return true;
+        }
+
+        if (fields[7] == "FIAT")
+            transaction.asset.type = paybridge::assets::AssetType::FIAT;
+        else if (fields[7] == "DIGITAL_ASSET")
+            transaction.asset.type = paybridge::assets::AssetType::DIGITAL_ASSET;
+        else
+        {
+            diagnostic = "Unrecognized asset type";
+            return false;
+        }
+
+        transaction.asset.code = fields[8];
+        transaction.asset.network = fields[9];
+        transaction.asset.contractAddress = fields[10];
+        try
+        {
+            std::size_t parsed = 0;
+            const unsigned long precision = std::stoul(fields[11], &parsed);
+            if (parsed != fields[11].size() || precision > 18)
+                throw std::invalid_argument("invalid precision");
+            transaction.asset.decimalPrecision = static_cast<std::uint8_t>(precision);
+            transaction.money.precision = static_cast<std::uint8_t>(precision);
+            transaction.money.units = transaction.amountMinor;
+        }
+        catch (...)
+        {
+            diagnostic = "Decimal precision is invalid";
+            return false;
+        }
+
+        if (!transaction.asset.isComplete())
+        {
+            diagnostic = "Asset identity is incomplete";
+            return false;
+        }
+        if (transaction.asset.isFiat() && transaction.asset.code != transaction.currency)
+        {
+            diagnostic = "Fiat asset code does not match currency";
+            return false;
+        }
+        if (transaction.asset.isFiat() &&
+            (!transaction.asset.network.empty() || !transaction.asset.contractAddress.empty()))
+        {
+            diagnostic = "Fiat asset must not contain network or contract fields";
+            return false;
+        }
+        return true;
+    }
+}
+
+TransactionLogger::CsvReadReport TransactionLogger::readTransactionsFromFile(
+    const std::string& path)
+{
+    CsvReadReport report;
+    std::lock_guard<std::mutex> lock(loggerMutex);
+    try
+    {
+        if (!std::filesystem::exists(path))
+            return report;
+        report.sourceExists = true;
+
+        std::ifstream file(path, std::ios::binary);
+        if (!file.is_open())
+        {
+            report.diagnostic = "Could not open CSV source";
+            return report;
+        }
+
+        std::vector<std::string> fields;
+        std::string rawHeader;
+        const CsvReadResult headerResult = readCsvRecord(file, fields, &rawHeader);
+        const std::vector<std::string> legacyHeader = {
+            "TransactionID", "ExternalReference", "AmountMinor", "Currency",
+            "Status", "Timestamp", "Environment"};
+        const std::vector<std::string> currentHeader = {
+            "TransactionID", "ExternalReference", "AmountMinor", "Currency",
+            "Status", "Timestamp", "Environment", "AssetType", "AssetCode",
+            "AssetNetwork", "ContractAddress", "DecimalPrecision"};
+        if (headerResult != CsvReadResult::RECORD ||
+            (fields != legacyHeader && fields != currentHeader))
+        {
+            report.rawHeader = std::move(rawHeader);
+            report.diagnostic = "CSV header is missing, malformed, or unsupported";
+            return report;
+        }
+        report.rawHeader = std::move(rawHeader);
+        report.headerValid = true;
+
+        std::size_t rowNumber = 0;
+        while (true)
+        {
+            CsvRecord record;
+            record.rowNumber = ++rowNumber;
+            const CsvReadResult readResult =
+                readCsvRecord(file, fields, &record.rawRecord);
+            if (readResult == CsvReadResult::END)
+                break;
+
+            if (readResult == CsvReadResult::MALFORMED)
+            {
+                record.diagnostic = "Malformed CSV quoting or record boundary";
+            }
+            else
+            {
+                record.columnCount = fields.size();
+                record.valid = parseTransactionRecord(
+                    fields, record.transaction, record.diagnostic);
+            }
+            report.records.push_back(std::move(record));
+        }
+    }
+    catch (const std::exception& error)
+    {
+        report.diagnostic = error.what();
+    }
+    return report;
+}
+
+std::string TransactionLogger::filePath()
+{
+    std::lock_guard<std::mutex> lock(loggerMutex);
+    return currentFilename;
 }
 
 void TransactionLogger::setFilePath(const std::string& path)

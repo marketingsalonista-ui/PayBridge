@@ -5,9 +5,19 @@
 #include <mutex>
 #include <optional>
 #include <unordered_map>
+#include <vector>
 
 namespace paybridge::assets
 {
+
+struct AssetReadModel
+{
+    std::string code;
+    std::string type;
+    std::uint8_t precision = 0;
+    // The registry currently stores enabled assets only.
+    bool enabled = true;
+};
 
 class AssetRegistry
 {
@@ -26,6 +36,7 @@ public:
     );
 
     bool contains(const Asset& asset) const;
+    std::vector<AssetReadModel> readModels() const;
     std::optional<Asset> findFiat(const std::string& code) const;
     std::optional<Asset> resolveDigitalAsset(
         const std::string& code,

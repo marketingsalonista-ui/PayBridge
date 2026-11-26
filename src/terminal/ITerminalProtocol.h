@@ -18,12 +18,27 @@ enum class SimulatedTerminalOutcome
     MALFORMED
 };
 
+// Internal PayBridge simulation contract only. These records are not a
+// physical terminal wire format and must not be used as vendor commands.
+struct SimulatedTerminalRequest
+{
+    std::string requestId;
+    std::string transactionId;
+    std::string externalReference;
+    std::string terminalId;
+    std::string amount;
+    std::string assetIdentity;
+};
+
 struct SimulatedTerminalResponse
 {
     SimulatedTerminalOutcome outcome = SimulatedTerminalOutcome::MALFORMED;
+    std::string requestId;
+    std::string transactionId;
     std::string terminalId;
     std::string externalReference;
     std::string simulatedResult;
+    bool simulated = true;
 };
 
 class ITerminalProtocol
@@ -32,13 +47,13 @@ public:
     virtual ~ITerminalProtocol() = default;
 
     virtual bool validateRequest(
-        const std::string& terminalId,
-        const std::string& externalReference,
+        const SimulatedTerminalRequest& request,
         const std::vector<std::uint8_t>& payload
     ) const = 0;
 
     virtual bool validateResponse(
-        const std::vector<std::uint8_t>& payload
+        const std::vector<std::uint8_t>& payload,
+        const SimulatedTerminalRequest& expectedRequest
     ) const = 0;
 };
 

@@ -3,14 +3,20 @@
 
 #include "../src/core/TransactionEngine.h"
 #include "../src/core/TransactionLogger.h"
+#include "../src/core/TransactionRepository.h"
+#include "../src/core/PaymentOrchestrationService.h"
 
 #include "../src/protocol/JsonHandler.h"
 #include "../src/transports/TcpTransport.h"
 #include "../src/transports/SerialTransport.h"
+#include "../src/transports/ITransport.h"
 #include "../src/terminal/TerminalModel.h"
 #include "../src/terminal/TerminalManager.h"
 #include "../src/terminal/SimulatedTerminalTransport.h"
 #include "../src/terminal/SimulatedTerminalProtocol.h"
+#include "../src/terminal/SimulatedTerminalAdapter.h"
+#include "../src/security/AuthManager.h"
+#include "../src/communication/CommunicationManager.h"
 
 #include <iostream>
 #include <cassert>
@@ -20,9 +26,542 @@
 #include <vector>
 #include <memory>
 #include <string>
+#include <cstdlib>
+#include <chrono>
+#include <atomic>
+#include <limits>
+#include <sqlite3.h>
+
+class CountingSimulatedTransport final : public paybridge::transport::ITransport
+{
+public:
+    CountingSimulatedTransport(paybridge::terminal::SimulatedTerminalOutcome outcome,
+        std::shared_ptr<std::atomic<int>> sends)
+        : inner(outcome), sends(std::move(sends)) {}
+    paybridge::transport::TransportResult open() override { return inner.open(); }
+    void close() noexcept override { inner.close(); }
+    bool isOpen() const noexcept override { return inner.isOpen(); }
+    paybridge::transport::TransportResult send(const std::vector<std::uint8_t>& bytes) override
+    { ++(*sends); return inner.send(bytes); }
+    paybridge::transport::TransportBytes receive(std::size_t maximum) override
+    { return inner.receive(maximum); }
+    void setReceiveTimeoutMilliseconds(std::uint32_t value) noexcept override
+    { inner.setReceiveTimeoutMilliseconds(value); }
+    void setSendTimeoutMilliseconds(std::uint32_t value) noexcept override
+    { inner.setSendTimeoutMilliseconds(value); }
+    std::string description() const override { return inner.description(); }
+private:
+    paybridge::terminal::SimulatedTerminalTransport inner;
+    std::shared_ptr<std::atomic<int>> sends;
+};
 
 int main()
 {
+    const auto suiteRoot = std::filesystem::temp_directory_path() /
+        ("paybridge_engine_suite_" + std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directories(suiteRoot);
+    const std::string testDatabasePath = (suiteRoot / "engine.sqlite").string();
+
+    // Repository tests use unique files under the OS temporary directory and
+    // never touch the application's configured database or CSV history.
+    {
+        const auto base = std::filesystem::temp_directory_path() /
+            ("paybridge_repository_" + std::to_string(
+                std::chrono::steady_clock::now().time_since_epoch().count()));
+        const std::string dbPath = base.string() + ".db";
+        const std::string futurePath = base.string() + "_future.db";
+        auto removeDb = [](const std::string& path) {
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+            std::filesystem::remove(path + "-wal", ec);
+            std::filesystem::remove(path + "-shm", ec);
+        };
+        paybridge::assets::AssetRegistry repositoryRegistry;
+        const auto usdAsset = repositoryRegistry.findFiat("USD");
+        assert(usdAsset);
+        Transaction tx;
+        tx.transactionId = "PB-REPOSITORY-TEST-1";
+        tx.externalReference = "REPOSITORY-TEST-REF-1";
+        tx.amountMinor = 1234;
+        tx.currency = "USD";
+        tx.status = TransactionStatus::CREATED;
+        tx.asset = *usdAsset;
+        tx.money = {1234, usdAsset->decimalPrecision};
+
+        {
+            TransactionRepository repo(dbPath);
+            assert(repo.initialize());
+            assert(repo.isInitialized());
+            assert(repo.saveTransaction(tx) == TransactionSaveResult::NEW_TRANSACTION);
+            assert(repo.saveTransaction(tx) == TransactionSaveResult::EXISTING_IDENTICAL);
+            Transaction samePayment = tx;
+            samePayment.transactionId = "PB-REPOSITORY-TEST-RETRY-ID";
+            assert(repo.saveTransaction(samePayment) == TransactionSaveResult::EXISTING_IDENTICAL);
+            Transaction conflict = tx;
+            conflict.money.units++;
+            assert(repo.saveTransaction(conflict) == TransactionSaveResult::CONFLICT);
+
+            sqlite3* raw = nullptr;
+            assert(sqlite3_open(dbPath.c_str(), &raw) == SQLITE_OK);
+            sqlite3_stmt* query = nullptr;
+            assert(sqlite3_prepare_v2(raw, "SELECT count(*) FROM transaction_lifecycle_events", -1, &query, nullptr) == SQLITE_OK);
+            assert(sqlite3_step(query) == SQLITE_ROW && sqlite3_column_int(query, 0) == 1);
+            sqlite3_finalize(query);
+            assert(sqlite3_exec(raw,
+                "CREATE TRIGGER reject_event BEFORE INSERT ON transaction_lifecycle_events BEGIN SELECT RAISE(ABORT,'injected'); END;",
+                nullptr, nullptr, nullptr) == SQLITE_OK);
+            sqlite3_close(raw);
+
+            Transaction rejected = tx;
+            rejected.transactionId = "PB-REPOSITORY-TEST-ATOMIC";
+            rejected.externalReference = "REPOSITORY-TEST-ATOMIC";
+            assert(repo.saveTransaction(rejected) == TransactionSaveResult::DATABASE_ERROR);
+            assert(repo.loadTransactions().size() == 1); // Insert rolled back with its event.
+
+            assert(sqlite3_open(dbPath.c_str(), &raw) == SQLITE_OK);
+            assert(sqlite3_exec(raw, "DROP TRIGGER reject_event", nullptr, nullptr, nullptr) == SQLITE_OK);
+            assert(sqlite3_close(raw) == SQLITE_OK);
+
+            assert(sqlite3_open(dbPath.c_str(), &raw) == SQLITE_OK);
+            assert(sqlite3_exec(raw,
+                "CREATE TRIGGER reject_sent_event BEFORE INSERT ON transaction_lifecycle_events "
+                "WHEN NEW.to_status='SENT' BEGIN SELECT RAISE(ABORT,'injected'); END;",
+                nullptr, nullptr, nullptr) == SQLITE_OK);
+            sqlite3_close(raw);
+            Transaction sent = tx;
+            sent.status = TransactionStatus::SENT;
+            assert(!repo.updateTransactionStatus(sent));
+            auto stillCreated = repo.loadTransactions();
+            assert(stillCreated.size() == 1 && stillCreated[0].status == TransactionStatus::CREATED);
+            assert(sqlite3_open(dbPath.c_str(), &raw) == SQLITE_OK);
+            assert(sqlite3_exec(raw, "DROP TRIGGER reject_sent_event", nullptr, nullptr, nullptr) == SQLITE_OK);
+            sqlite3_close(raw);
+            assert(repo.updateTransactionStatus(sent));
+            Transaction unknown = tx;
+            unknown.status = TransactionStatus::UNKNOWN;
+            assert(repo.updateTransactionStatus(unknown));
+            Transaction approved = tx;
+            approved.status = TransactionStatus::APPROVED;
+            assert(repo.updateTransactionStatus(approved));
+            assert(!repo.updateTransactionStatus(sent)); // Terminal state cannot move backwards.
+
+            auto loaded = repo.loadTransactions();
+            assert(loaded.size() == 1 && loaded[0].status == TransactionStatus::APPROVED);
+            repo.close();
+            assert(!repo.isInitialized());
+            assert(repo.initialize());
+            loaded = repo.loadTransactions();
+            assert(loaded.size() == 1 && loaded[0].status == TransactionStatus::APPROVED);
+
+            assert(sqlite3_open(dbPath.c_str(), &raw) == SQLITE_OK);
+            query = nullptr;
+            assert(sqlite3_prepare_v2(raw,
+                "SELECT from_status,to_status FROM transaction_lifecycle_events ORDER BY event_id", -1, &query, nullptr) == SQLITE_OK);
+            const std::vector<std::pair<std::string, std::string>> expected = {
+                {"", "CREATED"}, {"CREATED", "SENT"}, {"SENT", "UNKNOWN"}, {"UNKNOWN", "APPROVED"}};
+            for (const auto& pair : expected)
+            {
+                assert(sqlite3_step(query) == SQLITE_ROW);
+                const auto from = sqlite3_column_text(query, 0);
+                const auto to = sqlite3_column_text(query, 1);
+                assert((from ? reinterpret_cast<const char*>(from) : "") == pair.first);
+                assert((to ? reinterpret_cast<const char*>(to) : "") == pair.second);
+            }
+            assert(sqlite3_step(query) == SQLITE_DONE);
+            sqlite3_finalize(query);
+            assert(sqlite3_close(raw) == SQLITE_OK);
+            repo.close();
+        }
+
+        // Independently verify UNKNOWN round-trips without becoming INVALID.
+        tx.status = TransactionStatus::UNKNOWN;
+        tx.transactionId = "PB-REPOSITORY-UNKNOWN";
+        tx.externalReference = "REPOSITORY-UNKNOWN";
+        {
+            TransactionRepository repo(dbPath);
+            assert(repo.initialize());
+            assert(repo.saveTransaction(tx) == TransactionSaveResult::NEW_TRANSACTION);
+            repo.close();
+            assert(repo.initialize());
+            const auto loaded = repo.loadTransactions();
+            assert(loaded.size() == 2);
+            bool foundUnknown = false;
+            for (const auto& item : loaded)
+                if (item.transactionId == tx.transactionId)
+                    foundUnknown = item.status == TransactionStatus::UNKNOWN;
+            assert(foundUnknown);
+        }
+
+        sqlite3* future = nullptr;
+        assert(sqlite3_open(futurePath.c_str(), &future) == SQLITE_OK);
+        assert(sqlite3_exec(future,
+            "CREATE TABLE schema_metadata(metadata_key TEXT PRIMARY KEY, metadata_value TEXT);"
+            "INSERT INTO schema_metadata VALUES('schema_version','999');",
+            nullptr, nullptr, nullptr) == SQLITE_OK);
+        sqlite3_close(future);
+        {
+            TransactionRepository repo(futurePath);
+            assert(!repo.initialize());
+            assert(!repo.isInitialized());
+            assert(!repo.getLastError().empty());
+        }
+        assert(sqlite3_open(futurePath.c_str(), &future) == SQLITE_OK);
+        sqlite3_stmt* futureVersion = nullptr;
+        assert(sqlite3_prepare_v2(future,
+            "SELECT metadata_value FROM schema_metadata WHERE metadata_key='schema_version'",
+            -1, &futureVersion, nullptr) == SQLITE_OK);
+        assert(sqlite3_step(futureVersion) == SQLITE_ROW);
+        assert(std::string(reinterpret_cast<const char*>(sqlite3_column_text(futureVersion, 0))) == "999");
+        sqlite3_finalize(futureVersion);
+        sqlite3_close(future);
+
+        const std::string corruptPath = base.string() + "_corrupt.db";
+        {
+            TransactionRepository repo(corruptPath);
+            assert(repo.initialize());
+            assert(repo.saveTransaction(tx) == TransactionSaveResult::NEW_TRANSACTION);
+            repo.close();
+        }
+        {
+            TransactionRepository repo(corruptPath);
+            assert(repo.initialize());
+            sqlite3* corrupt = nullptr;
+            assert(sqlite3_open(corruptPath.c_str(), &corrupt) == SQLITE_OK);
+            assert(sqlite3_exec(corrupt,
+                "PRAGMA ignore_check_constraints=ON; UPDATE transactions SET lifecycle_state='ALIEN';",
+                nullptr, nullptr, nullptr) == SQLITE_OK);
+            sqlite3_close(corrupt);
+            assert(repo.loadTransactions().empty());
+            assert(repo.getLastError().find("lifecycle state") != std::string::npos);
+        }
+
+        // Two independent connections racing the same external reference must
+        // serialize and report one insert plus one identical replay.
+        const std::string concurrentPath = base.string() + "_concurrent.db";
+        Transaction concurrentTx = tx;
+        concurrentTx.transactionId = "PB-REPOSITORY-CONCURRENT";
+        concurrentTx.externalReference = "REPOSITORY-CONCURRENT";
+        concurrentTx.status = TransactionStatus::CREATED;
+        TransactionSaveResult concurrentResults[2] = {
+            TransactionSaveResult::DATABASE_ERROR, TransactionSaveResult::DATABASE_ERROR};
+        std::thread writers[2] = {
+            std::thread([&] { TransactionRepository r(concurrentPath); assert(r.initialize()); concurrentResults[0] = r.saveTransaction(concurrentTx); }),
+            std::thread([&] { TransactionRepository r(concurrentPath); assert(r.initialize()); concurrentResults[1] = r.saveTransaction(concurrentTx); })};
+        writers[0].join();
+        writers[1].join();
+        assert((concurrentResults[0] == TransactionSaveResult::NEW_TRANSACTION && concurrentResults[1] == TransactionSaveResult::EXISTING_IDENTICAL) ||
+               (concurrentResults[1] == TransactionSaveResult::NEW_TRANSACTION && concurrentResults[0] == TransactionSaveResult::EXISTING_IDENTICAL));
+
+        const std::string blocker = base.string() + "_blocker";
+        { std::ofstream file(blocker); file << "block"; }
+        TransactionRepository retry(blocker + "\\db.sqlite");
+        assert(!retry.initialize());
+        std::filesystem::remove(blocker);
+        assert(retry.initialize()); // Failed initialization left the object retryable.
+        retry.close();
+
+        const std::string pageDbPath = base.string() + "_pages.db";
+        {
+            TransactionRepository pageRepo(pageDbPath);
+            assert(pageRepo.initialize());
+            for (const std::string& id : {"PB-PAGE-A", "PB-PAGE-B", "PB-PAGE-C", "PB-PAGE-D", "PB-PAGE-E"})
+            {
+                Transaction row = tx;
+                row.transactionId = id;
+                row.externalReference = std::string("REF-") + id;
+                row.money = {123456789, 2};
+                row.amountMinor = row.money.units;
+                row.asset = *usdAsset;
+                row.currency = "USD";
+                row.status = TransactionStatus::CREATED;
+                assert(pageRepo.saveTransaction(row) == TransactionSaveResult::NEW_TRANSACTION);
+            }
+            sqlite3* pageDb = nullptr;
+            assert(sqlite3_open(pageDbPath.c_str(), &pageDb) == SQLITE_OK);
+            assert(sqlite3_exec(pageDb,
+                "UPDATE transactions SET created_at_unix=100,updated_at_unix=100;"
+                "UPDATE transactions SET lifecycle_state='APPROVED' WHERE transaction_id IN ('PB-PAGE-A','PB-PAGE-D');"
+                "UPDATE transactions SET lifecycle_state='DECLINED' WHERE transaction_id='PB-PAGE-B';"
+                "UPDATE transactions SET lifecycle_state='FAILED' WHERE transaction_id='PB-PAGE-E';"
+                "INSERT INTO replay_records(request_id,transaction_id,external_reference,canonical_request_hash,payment_fingerprint,request_timestamp_unix,request_expiry_unix,replay_state,created_at_unix,updated_at_unix,terminal_id)"
+                " VALUES('PAGE-REQUEST-A','PB-PAGE-A','REF-PB-PAGE-A','hash-hidden','fingerprint-hidden',100,200,'COMPLETED',100,101,'SIM-READ-001');",
+                nullptr, nullptr, nullptr) == SQLITE_OK);
+            sqlite3_close(pageDb);
+
+            const auto first = pageRepo.listTransactions(2);
+            assert(first.success && first.validRequest && first.transactions.size() == 2);
+            assert(first.transactions[0].transactionId == "PB-PAGE-E");
+            assert(first.transactions[1].transactionId == "PB-PAGE-D");
+            assert(first.hasMore && first.nextCursor);
+            assert(first.nextCursor->createdAtUnix == 100);
+            assert(first.nextCursor->transactionId == "PB-PAGE-D");
+
+            const auto second = pageRepo.listTransactions(2, std::nullopt, first.nextCursor);
+            assert(second.success && second.transactions.size() == 2 && second.hasMore);
+            assert(second.transactions[0].transactionId == "PB-PAGE-C");
+            assert(second.transactions[1].transactionId == "PB-PAGE-B");
+            const auto third = pageRepo.listTransactions(2, std::nullopt, second.nextCursor);
+            assert(third.success && third.transactions.size() == 1 && !third.hasMore);
+            assert(third.transactions[0].transactionId == "PB-PAGE-A");
+            assert(!third.nextCursor);
+
+            const auto approved = pageRepo.listTransactions(10, TransactionStatus::APPROVED);
+            assert(approved.success && approved.transactions.size() == 2);
+            assert(approved.transactions[0].transactionId == "PB-PAGE-D");
+            assert(approved.transactions[1].transactionId == "PB-PAGE-A");
+            const auto empty = pageRepo.listTransactions(10, TransactionStatus::UNKNOWN);
+            assert(empty.success && empty.transactions.empty() && !empty.hasMore);
+            assert(!pageRepo.listTransactions(0).validRequest);
+            assert(!pageRepo.listTransactions(10, std::nullopt, TransactionCursor{-1, "PB-PAGE-A"}).validRequest);
+            assert(!pageRepo.listTransactions(10, std::nullopt, TransactionCursor{100, ""}).validRequest);
+            assert(!pageRepo.listTransactions(10, std::nullopt,
+                TransactionCursor{100, std::string(257, 'x')}).validRequest);
+            const auto capped = pageRepo.listTransactions(1000);
+            assert(capped.success && capped.transactions.size() == 5 && !capped.hasMore);
+
+            const auto detail = pageRepo.findTransactionById("PB-PAGE-A");
+            assert(detail);
+            assert(detail->transactionId == "PB-PAGE-A");
+            assert(detail->money.units == 123456789 && detail->money.precision == 2);
+            assert(detail->asset.type == paybridge::assets::AssetType::FIAT);
+            assert(detail->asset.code == "USD" && detail->asset.decimalPrecision == 2);
+            assert(detail->status == TransactionStatus::APPROVED);
+            assert(detail->createdAtUnix == 100 && detail->updatedAtUnix == 100);
+            assert(detail->terminalId == "SIM-READ-001");
+            assert(!pageRepo.findTransactionById("missing"));
+            assert(!pageRepo.findTransactionById(std::string(257, 'x')));
+        }
+        removeDb(pageDbPath);
+        removeDb(dbPath);
+        removeDb(futurePath);
+        removeDb(concurrentPath);
+        removeDb(corruptPath);
+        removeDb(blocker + "\\db.sqlite");
+        std::error_code cleanupError;
+        std::filesystem::remove(base.string() + "_blocker", cleanupError);
+        std::cout << "SQLite repository tests passed!" << std::endl;
+    }
+
+    // Engine restore tests use SQLite directly and register configured assets
+    // before initialization, including non-default digital assets.
+    {
+        const std::string digitalDb = (suiteRoot / "digital-recovery.sqlite").string();
+        std::string originalId;
+        {
+            TransactionEngine engine(digitalDb, std::string{});
+            assert(engine.assets().registerUsdt("TRON_TESTNET", "CONFIGURED_TEST_CONTRACT", 6));
+            assert(engine.initialize());
+            const auto usdt = engine.assets().resolveDigitalAsset(
+                "USDT", "TRON_TESTNET", "CONFIGURED_TEST_CONTRACT");
+            assert(usdt);
+            Transaction created = engine.createTransaction(
+                paybridge::money::Money{1234567, 6}, *usdt, "USDT-RECOVERY-001");
+            assert(created.status == TransactionStatus::CREATED);
+            originalId = created.transactionId;
+            assert(engine.updateStatus(created, TransactionStatus::UNKNOWN));
+        }
+        {
+            TransactionEngine restored(digitalDb, std::string{});
+            assert(restored.assets().registerUsdt("TRON_TESTNET", "CONFIGURED_TEST_CONTRACT", 6));
+            assert(restored.initialize());
+            const auto usdt = restored.assets().resolveDigitalAsset(
+                "USDT", "TRON_TESTNET", "CONFIGURED_TEST_CONTRACT");
+            assert(usdt);
+            Transaction recovered = restored.createTransaction(
+                paybridge::money::Money{1234567, 6}, *usdt, "USDT-RECOVERY-001");
+            assert(recovered.transactionId == originalId);
+            assert(recovered.status == TransactionStatus::UNKNOWN);
+        }
+    }
+
+    // Separate engine instances see the canonical persisted state and reject
+    // a stale lifecycle update rather than overwriting a concurrent change.
+    {
+        TransactionEngine first(testDatabasePath, std::string{});
+        TransactionEngine second(testDatabasePath, std::string{});
+        Transaction a = first.createTransaction(3210, "USD", "CROSS-ENGINE-001");
+        Transaction b = second.createTransaction(3210, "USD", "CROSS-ENGINE-001");
+        assert(a.transactionId == b.transactionId);
+        assert(first.updateStatus(a, TransactionStatus::SENT));
+        assert(!second.updateStatus(b, TransactionStatus::FAILED));
+        Transaction refreshed = second.createTransaction(3210, "USD", "CROSS-ENGINE-001");
+        assert(refreshed.status == TransactionStatus::SENT);
+        assert(refreshed.transactionId == a.transactionId);
+    }
+
+    // Import legacy CSV snapshots once, preserve UNKNOWN, and block changed
+    // source bytes after a completed cutover rather than replaying the file.
+    {
+        const std::string migrationCsv = (suiteRoot / "migration-history.csv").string();
+        const std::string migrationDb = (suiteRoot / "migration-history.sqlite").string();
+        TransactionLogger::setFilePath(migrationCsv);
+        Transaction migrationTx;
+        migrationTx.transactionId = "PB-MIGRATION-HISTORY-001";
+        migrationTx.externalReference = "MIGRATION-HISTORY-001";
+        migrationTx.amountMinor = 2500;
+        migrationTx.currency = "USD";
+        migrationTx.status = TransactionStatus::CREATED;
+        paybridge::assets::AssetRegistry migrationAssets;
+        const auto usd = migrationAssets.findFiat("USD");
+        assert(usd);
+        migrationTx.asset = *usd;
+        migrationTx.money = {2500, usd->decimalPrecision};
+        assert(TransactionLogger::logTransaction(migrationTx));
+        migrationTx.status = TransactionStatus::SENT;
+        assert(TransactionLogger::logTransaction(migrationTx));
+        migrationTx.status = TransactionStatus::UNKNOWN;
+        assert(TransactionLogger::logTransaction(migrationTx));
+
+        std::string migratedId;
+        {
+            TransactionEngine migrated(migrationDb, migrationCsv);
+            assert(migrated.initialize());
+            Transaction recovered = migrated.createTransaction(
+                2500, "USD", "MIGRATION-HISTORY-001");
+            assert(recovered.status == TransactionStatus::UNKNOWN);
+            migratedId = recovered.transactionId;
+        }
+        {
+            TransactionEngine repeated(migrationDb, migrationCsv);
+            assert(repeated.initialize());
+            Transaction recovered = repeated.createTransaction(
+                2500, "USD", "MIGRATION-HISTORY-001");
+            assert(recovered.transactionId == migratedId);
+            assert(recovered.status == TransactionStatus::UNKNOWN);
+            assert(repeated.updateStatus(recovered, TransactionStatus::APPROVED));
+        }
+        {
+            TransactionEngine afterCutoverWrite(migrationDb, migrationCsv);
+            assert(afterCutoverWrite.initialize());
+            Transaction recovered = afterCutoverWrite.createTransaction(
+                2500, "USD", "MIGRATION-HISTORY-001");
+            assert(recovered.transactionId == migratedId);
+            assert(recovered.status == TransactionStatus::APPROVED);
+        }
+
+        migrationTx.status = TransactionStatus::APPROVED;
+        assert(TransactionLogger::logTransaction(migrationTx));
+        {
+            TransactionEngine changedSource(migrationDb, migrationCsv);
+            assert(!changedSource.initialize());
+            assert(!changedSource.persistenceError().empty());
+        }
+        {
+            TransactionRepository verify(migrationDb);
+            assert(verify.initialize());
+            const auto rows = verify.loadTransactions();
+            assert(rows.size() == 1 && rows[0].status == TransactionStatus::APPROVED);
+        }
+    }
+
+    // Seven-column legacy fiat rows infer exact precision from the registry.
+    {
+        const std::string legacyCsv = (suiteRoot / "migration-legacy-seven.csv").string();
+        const std::string legacyDb = (suiteRoot / "migration-legacy-seven.sqlite").string();
+        {
+            std::ofstream file(legacyCsv, std::ios::binary);
+            file << "TransactionID,ExternalReference,AmountMinor,Currency,Status,Timestamp,Environment\r\n"
+                 << "PB-LEGACY-7,LEGACY-7,1234,USD,CREATED,2026-01-01 10:00:00,SIMULATION\r\n"
+                 << "PB-LEGACY-7,LEGACY-7,1234,USD,UNKNOWN,2026-01-01 10:01:00,SIMULATION\r\n";
+        }
+        TransactionEngine legacy(legacyDb, legacyCsv);
+        assert(legacy.initialize());
+        Transaction recovered = legacy.createTransaction(1234, "USD", "LEGACY-7");
+        assert(recovered.status == TransactionStatus::UNKNOWN);
+        assert(recovered.money.precision == 2);
+    }
+
+    // Simulator/client-local attempts and server-authoritative records use
+    // distinct SQLite files and cannot observe or overwrite each other.
+    {
+        const std::string serverDb = (suiteRoot / "server.sqlite").string();
+        const std::string simulatorDb = (suiteRoot / "simulator.sqlite").string();
+        assert(std::filesystem::absolute(serverDb).lexically_normal() !=
+               std::filesystem::absolute(simulatorDb).lexically_normal());
+        TransactionEngine server(serverDb, std::string{});
+        TransactionEngine simulator(simulatorDb, std::string{});
+        Transaction serverTx = server.createTransaction(500, "USD", "ISOLATED-REF");
+        Transaction simulatorTx = simulator.createTransaction(500, "USD", "ISOLATED-REF");
+        assert(serverTx.status == TransactionStatus::CREATED);
+        assert(simulatorTx.status == TransactionStatus::CREATED);
+        assert(serverTx.transactionId != simulatorTx.transactionId);
+        assert(server.updateStatus(serverTx, TransactionStatus::SENT));
+        Transaction clientState = simulator.createTransaction(500, "USD", "ISOLATED-REF");
+        assert(clientState.status == TransactionStatus::CREATED);
+    }
+
+    // Malformed CSV and conflicting transaction histories are retained as
+    // failed migration batches and block engine startup without partial rows.
+    {
+        const std::string malformedCsv = (suiteRoot / "migration-malformed.csv").string();
+        const std::string malformedDb = (suiteRoot / "migration-malformed.sqlite").string();
+        {
+            std::ofstream file(malformedCsv, std::ios::binary);
+            file << "TransactionID,ExternalReference,AmountMinor,Currency,Status,Timestamp,Environment,AssetType,AssetCode,AssetNetwork,ContractAddress,DecimalPrecision\n"
+                 << "PB-MALFORMED,REF-MALFORMED,1000,USD,CREATED,2026-01-01,SIMULATION,FIAT,USD,,,2\n"
+                 << "\"unterminated,CSV,row\n";
+        }
+        TransactionEngine malformed(malformedDb, malformedCsv);
+        assert(!malformed.initialize());
+        assert(malformed.persistenceError().find("Malformed") != std::string::npos);
+        TransactionRepository failedBatch(malformedDb);
+        assert(failedBatch.initialize());
+        assert(failedBatch.loadTransactions().empty());
+        sqlite3* raw = nullptr;
+        assert(sqlite3_open(malformedDb.c_str(), &raw) == SQLITE_OK);
+        sqlite3_stmt* batchQuery = nullptr;
+        assert(sqlite3_prepare_v2(raw,
+            "SELECT status, conflict_count FROM migration_batches",
+            -1, &batchQuery, nullptr) == SQLITE_OK);
+        assert(sqlite3_step(batchQuery) == SQLITE_ROW);
+        assert(std::string(reinterpret_cast<const char*>(sqlite3_column_text(batchQuery, 0))) == "FAILED");
+        assert(sqlite3_column_int(batchQuery, 1) > 0);
+        sqlite3_finalize(batchQuery);
+        assert(sqlite3_close(raw) == SQLITE_OK);
+    }
+    {
+        const std::string conflictCsv = (suiteRoot / "migration-conflict.csv").string();
+        const std::string conflictDb = (suiteRoot / "migration-conflict.sqlite").string();
+        std::ofstream file(conflictCsv, std::ios::binary);
+        file << "TransactionID,ExternalReference,AmountMinor,Currency,Status,Timestamp,Environment,AssetType,AssetCode,AssetNetwork,ContractAddress,DecimalPrecision\n"
+             << "PB-CONFLICT-A,REF-CONFLICT,1000,USD,CREATED,2026-01-01,SIMULATION,FIAT,USD,,,2\n"
+             << "PB-CONFLICT-B,REF-CONFLICT,1000,USD,CREATED,2026-01-01,SIMULATION,FIAT,USD,,,2\n";
+        file.close();
+        TransactionEngine conflict(conflictDb, conflictCsv);
+        assert(!conflict.initialize());
+        assert(conflict.persistenceError().find("conflicting") != std::string::npos);
+        TransactionRepository failedConflict(conflictDb);
+        assert(failedConflict.initialize());
+        assert(failedConflict.loadTransactions().empty());
+    }
+
+    TransactionLogger::resetFilePath();
+
+    const std::string testToken = AuthManager::generateBearerToken();
+    assert(!testToken.empty());
+    assert(AuthManager::validateBearerTokenFormat(testToken));
+
+    AuthManager validAuth = AuthManager::fromBearerToken(testToken, AuthManager::Mode::DEVELOPMENT);
+    assert(validAuth.isConfigured());
+    assert(validAuth.verifyAuthorization("Authorization: Bearer " + testToken) ==
+           AuthManager::VerificationResult::ALLOWED);
+    assert(validAuth.verifyAuthorization("") == AuthManager::VerificationResult::MISSING);
+    assert(validAuth.verifyAuthorization("Bearer " + testToken) ==
+           AuthManager::VerificationResult::MALFORMED);
+    assert(validAuth.verifyAuthorization("Authorization: Basic abc") ==
+           AuthManager::VerificationResult::MALFORMED);
+
+    const std::string invalidToken = AuthManager::generateBearerToken();
+    assert(!invalidToken.empty());
+    assert(validAuth.verifyAuthorization("Authorization: Bearer " + invalidToken) ==
+           AuthManager::VerificationResult::INVALID);
+
+    AuthManager unconfigured = AuthManager::fromBearerToken("", AuthManager::Mode::PRODUCTION);
+    assert(!unconfigured.isConfigured());
+    assert(unconfigured.verifyAuthorization("") ==
+           AuthManager::VerificationResult::NOT_CONFIGURED);
+
     paybridge::assets::AssetRegistry registry;
 
     const auto usd = registry.findFiat("USD");
@@ -58,8 +597,36 @@ int main()
         "UNCONFIGURED_CONTRACT"
     ));
 
-    const std::string testLog = "transaction_engine_tests.csv";
-    const std::string blockerPath = "transaction_engine_log_blocker";
+    assert(registry.registerUsdt("OTHER_TESTNET", "ANOTHER_CONFIGURED_CONTRACT", 6));
+    const auto assetReadModels = registry.readModels();
+    assert(!assetReadModels.empty());
+    const auto repeatedAssetReadModels = registry.readModels();
+    assert(assetReadModels.size() == repeatedAssetReadModels.size());
+    for (std::size_t index = 0; index < assetReadModels.size(); ++index)
+    {
+        assert(!assetReadModels[index].type.empty());
+        assert(assetReadModels[index].type == repeatedAssetReadModels[index].type);
+        assert(assetReadModels[index].code == repeatedAssetReadModels[index].code);
+        assert(assetReadModels[index].precision == repeatedAssetReadModels[index].precision);
+        assert(assetReadModels[index].enabled);
+        if (index > 0)
+        {
+            const auto& previous = assetReadModels[index - 1];
+            const auto& current = assetReadModels[index];
+            assert(previous.type < current.type ||
+                (previous.type == current.type && previous.code < current.code) ||
+                (previous.type == current.type && previous.code == current.code &&
+                 previous.precision <= current.precision));
+        }
+    }
+    std::size_t usdtReadModelCount = 0;
+    for (const auto& asset : assetReadModels)
+        if (asset.code == "USDT" && asset.type == "DIGITAL_ASSET" && asset.precision == 6)
+            ++usdtReadModelCount;
+    assert(usdtReadModelCount == 1);
+
+    const std::string testLog = (suiteRoot / "transaction_engine_tests.csv").string();
+    const std::string blockerPath = (suiteRoot / "database_blocker").string();
 
     // Use a separate log so production transaction history is untouched.
     TransactionLogger::setFilePath(testLog);
@@ -67,7 +634,7 @@ int main()
     std::filesystem::remove_all(blockerPath);
 
     {
-        TransactionEngine engine;
+        TransactionEngine engine(testDatabasePath, std::string{});
 
         // Test 1: Successful payment
         Transaction approved =
@@ -225,7 +792,7 @@ int main()
     std::string savedTransactionId;
 
     {
-        TransactionEngine firstEngine;
+        TransactionEngine firstEngine(testDatabasePath, std::string{});
 
         Transaction transaction =
             firstEngine.createTransaction(25000, "AED", "POS-RESTART-001");
@@ -241,7 +808,7 @@ int main()
 
     // The first engine has now been destroyed.
     {
-        TransactionEngine restartedEngine;
+        TransactionEngine restartedEngine(testDatabasePath, std::string{});
 
         Transaction recovered =
             restartedEngine.createTransaction(
@@ -254,18 +821,15 @@ int main()
 
     // Tests 15 and 16: Persistence failure handling
     {
-        TransactionEngine reliabilityEngine;
+        const std::string blockedDatabase = blockerPath + "/transactions.sqlite";
 
-        // Create a regular file where the log directory should be.
-        // This deliberately makes log directory creation fail.
+        // Create a regular file where SQLite needs a parent directory.
         std::ofstream blocker(blockerPath);
         assert(blocker.is_open());
         blocker.close();
 
-        // Test 15: Failed logging must not register a new transaction.
-        TransactionLogger::setFilePath(
-            blockerPath + "/transactions.csv"
-        );
+        // Test 15: failed database initialization must not register a transaction.
+        TransactionEngine reliabilityEngine(blockedDatabase, std::string{});
 
         Transaction failedCreation =
             reliabilityEngine.createTransaction(
@@ -274,8 +838,8 @@ int main()
 
         assert(failedCreation.status == TransactionStatus::FAILED);
 
-        // Restore the test log and retry the same external reference.
-        TransactionLogger::setFilePath(testLog);
+        // Remove the blocker and retry. Failed initialization must be retryable.
+        std::filesystem::remove(blockerPath);
 
         Transaction retryCreation =
             reliabilityEngine.createTransaction(
@@ -285,10 +849,14 @@ int main()
         assert(retryCreation.status == TransactionStatus::CREATED);
         assert(!retryCreation.transactionId.empty());
 
-        // Test 16: Failed status logging must not change transaction state.
-        TransactionLogger::setFilePath(
-            blockerPath + "/transactions.csv"
-        );
+        // Test 16: failed atomic status persistence must not change engine memory.
+        sqlite3* failureDb = nullptr;
+        assert(sqlite3_open(blockedDatabase.c_str(), &failureDb) == SQLITE_OK);
+        assert(sqlite3_exec(failureDb,
+            "CREATE TRIGGER reject_engine_sent BEFORE INSERT ON transaction_lifecycle_events "
+            "WHEN NEW.to_status='SENT' BEGIN SELECT RAISE(ABORT,'injected'); END;",
+            nullptr, nullptr, nullptr) == SQLITE_OK);
+        sqlite3_close(failureDb);
 
         bool updateResult =
             reliabilityEngine.updateStatus(
@@ -299,8 +867,9 @@ int main()
         assert(!updateResult);
         assert(retryCreation.status == TransactionStatus::CREATED);
 
-        // Restore logging and confirm the same update can now succeed.
-        TransactionLogger::setFilePath(testLog);
+        assert(sqlite3_open(blockedDatabase.c_str(), &failureDb) == SQLITE_OK);
+        assert(sqlite3_exec(failureDb, "DROP TRIGGER reject_engine_sent", nullptr, nullptr, nullptr) == SQLITE_OK);
+        sqlite3_close(failureDb);
 
         assert(
             reliabilityEngine.updateStatus(
@@ -311,12 +880,11 @@ int main()
 
         assert(retryCreation.status == TransactionStatus::SENT);
 
-        std::filesystem::remove(blockerPath);
     }
 
     // Test 17: Concurrent duplicate transaction requests
     {
-        TransactionEngine concurrentEngine;
+        TransactionEngine concurrentEngine(testDatabasePath, std::string{});
 
         const int threadCount = 20;
         const std::string externalReference = "POS-CONCURRENT-001";
@@ -354,20 +922,18 @@ int main()
             assert(result.transactionId == firstTransactionId);
         }
 
-        // Verify only one transaction record was created.
-        std::ifstream logFile(testLog);
-        std::string line;
-        int matchingRecords = 0;
-
-        while (std::getline(logFile, line))
-        {
-            if (line.find(externalReference) != std::string::npos)
-            {
-                ++matchingRecords;
-            }
-        }
-
-        assert(matchingRecords == 1);
+        // Verify only one transaction record was created in SQLite.
+        sqlite3* concurrentDb = nullptr;
+        assert(sqlite3_open(testDatabasePath.c_str(), &concurrentDb) == SQLITE_OK);
+        sqlite3_stmt* concurrentCount = nullptr;
+        assert(sqlite3_prepare_v2(concurrentDb,
+            "SELECT count(*) FROM transactions WHERE external_reference=?",
+            -1, &concurrentCount, nullptr) == SQLITE_OK);
+        sqlite3_bind_text(concurrentCount, 1, externalReference.c_str(), -1, SQLITE_TRANSIENT);
+        assert(sqlite3_step(concurrentCount) == SQLITE_ROW);
+        assert(sqlite3_column_int(concurrentCount, 0) == 1);
+        sqlite3_finalize(concurrentCount);
+        sqlite3_close(concurrentDb);
 
         std::cout << "Concurrent duplicate request test passed!"
                   << std::endl;
@@ -427,7 +993,7 @@ int main()
     // Test 24: Malformed CSV records must not affect valid records
     {
         const std::string malformedLog =
-            "transaction_engine_malformed_tests.csv";
+            (suiteRoot / "transaction_engine_malformed_tests.csv").string();
 
         TransactionLogger::setFilePath(malformedLog);
 
@@ -485,7 +1051,7 @@ int main()
     // Test 25: Incomplete quoted CSV record at EOF
     {
         const std::string incompleteLog =
-            "transaction_engine_incomplete_tests.csv";
+            (suiteRoot / "transaction_engine_incomplete_tests.csv").string();
 
         TransactionLogger::setFilePath(incompleteLog);
 
@@ -546,14 +1112,14 @@ int main()
     // attempt backward SENT/RECEIVED transitions when retried.
     {
         const std::string p0Log =
-            "transaction_engine_p0_regression_tests.csv";
+            (suiteRoot / "transaction_engine_p0_regression_tests.csv").string();
 
         // Isolate this test from application and previous test history.
         TransactionLogger::setFilePath(p0Log);
         std::filesystem::remove(p0Log);
 
         {
-            TransactionEngine engine;
+            TransactionEngine engine(testDatabasePath, std::string{});
 
             Transaction received =
                 engine.createTransaction(7000, "AED", "POS-P0-RECEIVED");
@@ -614,33 +1180,58 @@ int main()
         using namespace paybridge::terminal;
         using namespace paybridge::transport;
 
+        SimulatedTerminalRequest simulatedRequest;
+        simulatedRequest.requestId = "0123456789abcdef0123456789abcdef";
+        simulatedRequest.transactionId = "PB-SIMULATED-001";
+        simulatedRequest.externalReference = "POS-SIM-001";
+        simulatedRequest.terminalId = "SIM-TERMINAL-001";
+        simulatedRequest.amount = "12.34";
+        simulatedRequest.assetIdentity = "FIAT:AED";
+        const std::vector<std::uint8_t> request =
+            SimulatedTerminalProtocol::encodeRequest(simulatedRequest);
+
         SimulatedTerminalTransport approved(SimulatedTerminalOutcome::APPROVED);
         assert(approved.open().success);
-
-        const std::vector<std::uint8_t> request = {'S', 'I', 'M'};
         assert(approved.send(request).success);
 
-        TransportBytes approvedResponse = approved.receive(128);
+        TransportBytes approvedResponse = approved.receive(1024);
         assert(approvedResponse.result.success);
 
         SimulatedTerminalProtocol protocol;
-        assert(protocol.validateRequest("VX680-DEMO-001", "POS-SIM-001", request));
-        assert(protocol.validateResponse(approvedResponse.data));
+        assert(protocol.validateRequest(simulatedRequest, request));
+        assert(protocol.validateResponse(approvedResponse.data, simulatedRequest));
 
         SimulatedTerminalResponse parsed =
-            protocol.parseResponse(approvedResponse.data, "VX680-DEMO-001");
+            protocol.parseResponse(approvedResponse.data, simulatedRequest);
         assert(parsed.outcome == SimulatedTerminalOutcome::APPROVED);
         assert(parsed.simulatedResult.find("SIMULATED") != std::string::npos);
+        assert(parsed.requestId == simulatedRequest.requestId);
+        assert(parsed.transactionId == simulatedRequest.transactionId);
+        assert(parsed.externalReference == simulatedRequest.externalReference);
+        assert(parsed.terminalId == simulatedRequest.terminalId);
+        assert(parsed.simulated);
+
+        auto mismatchedResponse = nlohmann::json::parse(
+            approvedResponse.data.begin(), approvedResponse.data.end());
+        for (const auto& field : {"request_id", "transaction_id", "external_reference", "terminal_id"})
+        {
+            auto tampered = mismatchedResponse;
+            tampered[field] = "MISMATCH";
+            const std::string text = tampered.dump();
+            const std::vector<std::uint8_t> bytes(text.begin(), text.end());
+            assert(!protocol.validateResponse(bytes, simulatedRequest));
+            assert(protocol.parseResponse(bytes, simulatedRequest).outcome == SimulatedTerminalOutcome::MALFORMED);
+        }
         approved.close();
         assert(!approved.isOpen());
 
         SimulatedTerminalTransport declined(SimulatedTerminalOutcome::DECLINED);
         assert(declined.open().success);
         assert(declined.send(request).success);
-        TransportBytes declinedResponse = declined.receive(128);
+        TransportBytes declinedResponse = declined.receive(1024);
         assert(declinedResponse.result.success);
-        assert(protocol.validateResponse(declinedResponse.data));
-        parsed = protocol.parseResponse(declinedResponse.data, "VX680-DEMO-001");
+        assert(protocol.validateResponse(declinedResponse.data, simulatedRequest));
+        parsed = protocol.parseResponse(declinedResponse.data, simulatedRequest);
         assert(parsed.outcome == SimulatedTerminalOutcome::DECLINED);
         declined.close();
 
@@ -648,7 +1239,7 @@ int main()
         timeout.setReceiveTimeoutMilliseconds(50);
         assert(timeout.open().success);
         assert(timeout.send(request).success);
-        TransportBytes timeoutResponse = timeout.receive(128);
+        TransportBytes timeoutResponse = timeout.receive(1024);
         assert(!timeoutResponse.result.success);
         assert(timeoutResponse.result.error == TransportError::TIMEOUT);
         timeout.close();
@@ -659,16 +1250,87 @@ int main()
         SimulatedTerminalTransport malformed(SimulatedTerminalOutcome::MALFORMED);
         assert(malformed.open().success);
         assert(malformed.send(request).success);
-        TransportBytes malformedResponse = malformed.receive(128);
+        TransportBytes malformedResponse = malformed.receive(1024);
         assert(malformedResponse.result.success);
-        assert(!protocol.validateResponse(malformedResponse.data));
-        parsed = protocol.parseResponse(malformedResponse.data, "VX680-DEMO-001");
+        assert(!protocol.validateResponse(malformedResponse.data, simulatedRequest));
+        parsed = protocol.parseResponse(malformedResponse.data, simulatedRequest);
         assert(parsed.outcome == SimulatedTerminalOutcome::MALFORMED);
         malformed.close();
 
-        assert(!protocol.validateRequest("", "POS-SIM", request));
-        assert(!protocol.validateRequest("VX680-DEMO-001", "", request));
-        assert(!protocol.validateRequest("VX680-DEMO-001", "POS-SIM", {}));
+        auto invalidRequest = simulatedRequest;
+        invalidRequest.terminalId.clear();
+        assert(!protocol.validateRequest(invalidRequest, request));
+        assert(!protocol.validateRequest(simulatedRequest, {}));
+
+        TerminalManager snapshotManager;
+        assert(snapshotManager.terminalSnapshots().empty());
+        TerminalModel disconnectedSimulator;
+        disconnectedSimulator.terminalId = "SNAPSHOT-SIM-DISCONNECTED";
+        disconnectedSimulator.transportKind = TransportKind::SIMULATED;
+        snapshotManager.registerTerminal(disconnectedSimulator);
+        snapshotManager.setTransport(disconnectedSimulator.terminalId,
+            std::make_unique<SimulatedTerminalTransport>(SimulatedTerminalOutcome::APPROVED));
+        TerminalModel connectingSimulator = disconnectedSimulator;
+        connectingSimulator.terminalId = "SNAPSHOT-SIM-CONNECTING";
+        connectingSimulator.connectionStatus = TerminalConnectionStatus::CONNECTING;
+        snapshotManager.registerTerminal(connectingSimulator);
+        snapshotManager.setTransport(connectingSimulator.terminalId,
+            std::make_unique<SimulatedTerminalTransport>(SimulatedTerminalOutcome::APPROVED));
+        TerminalModel unknownSimulator = disconnectedSimulator;
+        unknownSimulator.terminalId = "SNAPSHOT-SIM-UNKNOWN";
+        unknownSimulator.connectionStatus = TerminalConnectionStatus::UNKNOWN;
+        snapshotManager.registerTerminal(unknownSimulator);
+        snapshotManager.setTransport(unknownSimulator.terminalId,
+            std::make_unique<SimulatedTerminalTransport>(SimulatedTerminalOutcome::APPROVED));
+        TerminalModel failedSimulator = disconnectedSimulator;
+        failedSimulator.terminalId = "SNAPSHOT-SIM-FAILED";
+        failedSimulator.connectionStatus = TerminalConnectionStatus::FAILED;
+        snapshotManager.registerTerminal(failedSimulator);
+        snapshotManager.setTransport(failedSimulator.terminalId,
+            std::make_unique<SimulatedTerminalTransport>(SimulatedTerminalOutcome::APPROVED));
+        TerminalModel unconfiguredSimulator = disconnectedSimulator;
+        unconfiguredSimulator.terminalId = "SNAPSHOT-SIM-UNCONFIGURED";
+        snapshotManager.registerTerminal(unconfiguredSimulator);
+        TerminalModel nonSimulator = disconnectedSimulator;
+        nonSimulator.terminalId = "SNAPSHOT-NON-SIMULATED";
+        nonSimulator.transportKind = TransportKind::TCP;
+        snapshotManager.registerTerminal(nonSimulator);
+        snapshotManager.setTransport(nonSimulator.terminalId,
+            std::make_unique<SimulatedTerminalTransport>(SimulatedTerminalOutcome::APPROVED));
+
+        const auto terminalSnapshots = snapshotManager.terminalSnapshots();
+        assert(terminalSnapshots.size() == 6);
+        for (std::size_t index = 1; index < terminalSnapshots.size(); ++index)
+            assert(terminalSnapshots[index - 1].terminalId < terminalSnapshots[index].terminalId);
+        auto snapshotFor = [&](const std::string& id) -> const TerminalReadModel& {
+            for (const auto& snapshot : terminalSnapshots)
+                if (snapshot.terminalId == id) return snapshot;
+            assert(false);
+            return terminalSnapshots.front();
+        };
+        const auto& disconnectedSnapshot = snapshotFor("SNAPSHOT-SIM-DISCONNECTED");
+        assert(disconnectedSnapshot.simulated && disconnectedSnapshot.configured);
+        assert(disconnectedSnapshot.connectionStatus == "DISCONNECTED");
+        assert(disconnectedSnapshot.available); // Simulator can connect when the operation begins.
+        assert(snapshotFor("SNAPSHOT-SIM-CONNECTING").configured &&
+               !snapshotFor("SNAPSHOT-SIM-CONNECTING").available);
+        assert(snapshotFor("SNAPSHOT-SIM-UNKNOWN").connectionStatus == "UNKNOWN" &&
+               !snapshotFor("SNAPSHOT-SIM-UNKNOWN").available);
+        assert(snapshotFor("SNAPSHOT-SIM-FAILED").connectionStatus == "FAILED" &&
+               !snapshotFor("SNAPSHOT-SIM-FAILED").available);
+        assert(!snapshotFor("SNAPSHOT-SIM-UNCONFIGURED").configured &&
+               !snapshotFor("SNAPSHOT-SIM-UNCONFIGURED").available);
+        assert(!snapshotFor("SNAPSHOT-NON-SIMULATED").simulated &&
+               snapshotFor("SNAPSHOT-NON-SIMULATED").configured &&
+               !snapshotFor("SNAPSHOT-NON-SIMULATED").available);
+        assert(snapshotFor("SNAPSHOT-SIM-DISCONNECTED").connectionStatus == "DISCONNECTED");
+        assert(snapshotManager.connect("SNAPSHOT-SIM-DISCONNECTED").success);
+        const auto connectedSnapshot = snapshotManager.terminalSnapshots().front();
+        assert(connectedSnapshot.terminalId == "SNAPSHOT-NON-SIMULATED"); // Stable ID ordering.
+        const auto afterConnect = snapshotManager.terminalSnapshots();
+        for (const auto& snapshot : afterConnect)
+            if (snapshot.terminalId == "SNAPSHOT-SIM-DISCONNECTED")
+                assert(snapshot.connectionStatus == "CONNECTED" && snapshot.available);
 
         TerminalManager terminalManager;
 
@@ -694,15 +1356,30 @@ int main()
             )
         );
 
+        std::string selectedTerminal;
+        std::string selectionError;
+        assert(terminalManager.selectSimulatedTerminal("", selectedTerminal, selectionError));
+        assert(selectedTerminal == "VX680-DEMO-001");
+        assert(terminalManager.selectSimulatedTerminal(
+            "VX680-DEMO-001", selectedTerminal, selectionError));
+        terminalManager.setTransport(
+            "VX680-DEMO-002",
+            std::make_unique<SimulatedTerminalTransport>(SimulatedTerminalOutcome::DECLINED));
+        assert(!terminalManager.selectSimulatedTerminal("", selectedTerminal, selectionError));
+        assert(selectionError == "Terminal selection is ambiguous");
+        assert(terminalManager.selectSimulatedTerminal(
+            "VX680-DEMO-002", selectedTerminal, selectionError));
+        assert(selectedTerminal == "VX680-DEMO-002");
+
         assert(terminalManager.connect("VX680-DEMO-001").success);
 
         TransportBytes managerResponse = terminalManager.sendAndReceive(
             "VX680-DEMO-001",
             request,
-            128
+            1024
         );
         assert(managerResponse.result.success);
-        assert(protocol.validateResponse(managerResponse.data));
+        assert(protocol.validateResponse(managerResponse.data, simulatedRequest));
 
         terminalManager.disconnect("VX680-DEMO-001");
         assert(!terminalManager.sendAndReceive(
@@ -732,6 +1409,444 @@ int main()
 
         std::cout << "Terminal transport foundation tests passed!" << std::endl;
     }
+
+    // Orchestration service simulator workflow smoke and replay check.
+    {
+        using namespace paybridge::terminal;
+        const std::string workflowDb = (suiteRoot / "workflow.sqlite").string();
+        TransactionEngine workflowEngine(workflowDb, std::string{});
+        assert(workflowEngine.initialize());
+        const auto aed = workflowEngine.assets().findFiat("AED");
+        assert(aed);
+        TerminalManager terminals;
+        TerminalModel terminal;
+        terminal.terminalId = "SIM-WORKFLOW-001";
+        terminal.transportKind = TransportKind::SIMULATED;
+        terminals.registerTerminal(terminal);
+        terminals.registerAdapter(std::make_shared<SimulatedTerminalAdapter>());
+        auto sendCount = std::make_shared<std::atomic<int>>(0);
+        terminals.setTransport(terminal.terminalId,
+            std::make_unique<CountingSimulatedTransport>(SimulatedTerminalOutcome::APPROVED, sendCount));
+        PaymentOrchestrationService service(workflowEngine, terminals);
+        PaymentRequest request;
+        request.envelope.requestId = "2123456789abcdef0123456789abcdef";
+        request.envelope.requestTimestamp = 1760000000;
+        request.envelope.requestExpiry = 1760000300;
+        request.externalReference = "SIM-WORKFLOW-REF-001";
+        request.asset = *aed;
+        request.money = {1234, aed->decimalPrecision};
+        request.canonicalRequestHash = "canonical-workflow-test";
+        request.paymentFingerprint = "fingerprint-workflow-test";
+        const auto result = service.process(request);
+        assert(result.status == "APPROVED");
+        assert(result.resultCode == "SIMULATED_APPROVED");
+        assert(result.simulated);
+        assert(result.terminalId == terminal.terminalId);
+        const auto retry = service.process(request);
+        assert(retry.status == "APPROVED");
+        assert(*sendCount == 1);
+        assert(retry.transactionId == result.transactionId);
+        assert(retry.message.find("SIMULATED APPROVED") != std::string::npos);
+    }
+
+    // End-to-end orchestration outcomes and durable restart safety.
+    {
+        using namespace paybridge::terminal;
+        const auto runOutcome = [&](const std::string& suffix, SimulatedTerminalOutcome outcome,
+                                    const std::string& expectedStatus)
+        {
+            const std::string dbPath = (suiteRoot / ("workflow_" + suffix + ".sqlite")).string();
+            TransactionEngine workflowEngine(dbPath, std::string{});
+            assert(workflowEngine.initialize());
+            const auto aed = workflowEngine.assets().findFiat("AED");
+            assert(aed);
+            TerminalManager terminals;
+            TerminalModel terminal;
+            terminal.terminalId = "SIM-" + suffix;
+            terminal.transportKind = TransportKind::SIMULATED;
+            terminals.registerTerminal(terminal);
+            terminals.registerAdapter(std::make_shared<SimulatedTerminalAdapter>());
+            auto sendCount = std::make_shared<std::atomic<int>>(0);
+            terminals.setTransport(terminal.terminalId,
+                std::make_unique<CountingSimulatedTransport>(outcome, sendCount));
+            PaymentOrchestrationService service(workflowEngine, terminals);
+            PaymentRequest request;
+            static std::size_t outcomeRequestNumber = 1;
+            constexpr char HEX[] = "0123456789abcdef";
+            std::size_t requestNumber = outcomeRequestNumber++;
+            request.envelope.requestId.assign(32, '0');
+            for (std::size_t index = request.envelope.requestId.size(); index > 0 && requestNumber; --index)
+            {
+                request.envelope.requestId[index - 1] = HEX[requestNumber & 0x0f];
+                requestNumber >>= 4;
+            }
+            request.envelope.requestTimestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            request.envelope.requestExpiry = request.envelope.requestTimestamp + 300;
+            request.externalReference = "SIM-OUTCOME-" + suffix;
+            request.asset = *aed;
+            request.money = {500, aed->decimalPrecision};
+            request.canonicalRequestHash = "canonical-" + suffix;
+            request.paymentFingerprint = "fingerprint-" + suffix;
+            const auto result = service.process(request);
+            if (result.status != expectedStatus)
+                std::cerr << "Simulated outcome " << suffix << " returned " << result.status
+                          << " (" << result.resultCode << "): " << result.message << "\n";
+            assert(result.status == expectedStatus);
+            assert(result.simulated);
+            if (expectedStatus == "APPROVED" || expectedStatus == "DECLINED")
+                assert(result.message.find("no real payment was processed") != std::string::npos);
+            if (expectedStatus == "UNKNOWN")
+                assert(result.message.find("automatic resend is disabled") != std::string::npos);
+
+            const auto replay = service.process(request);
+            assert(replay.status == expectedStatus);
+            assert(*sendCount == (expectedStatus == "FAILED" ? 0 : 1));
+            assert(replay.transactionId == result.transactionId);
+            assert(replay.terminalId == result.terminalId);
+            if (expectedStatus == "APPROVED")
+                assert(replay.message.find("SIMULATED APPROVED") != std::string::npos);
+        };
+        runOutcome("APPROVE", SimulatedTerminalOutcome::APPROVED, "APPROVED");
+        runOutcome("DECLINE", SimulatedTerminalOutcome::DECLINED, "DECLINED");
+        runOutcome("TIMEOUT", SimulatedTerminalOutcome::TIMEOUT, "UNKNOWN");
+        runOutcome("MALFORMED", SimulatedTerminalOutcome::MALFORMED, "UNKNOWN");
+        runOutcome("DISCONNECT", SimulatedTerminalOutcome::DISCONNECTED, "FAILED");
+
+        const std::string recoveryDb = (suiteRoot / "workflow_recovery.sqlite").string();
+        const std::string requestId = "3123456789abcdef0123456789abcdef";
+        RequestReplayData replayData;
+        replayData.requestId = requestId;
+        replayData.canonicalRequestHash = "recovery-canonical";
+        replayData.paymentFingerprint = "recovery-fingerprint";
+        replayData.requestTimestamp = 1;
+        replayData.requestExpiry = 2;
+        std::string transactionId;
+        {
+            TransactionEngine engine(recoveryDb, std::string{});
+            assert(engine.initialize());
+            const auto aed = engine.assets().findFiat("AED");
+            assert(aed);
+            const auto registered = engine.createTransaction(
+                paybridge::money::Money{700, aed->decimalPrecision}, *aed,
+                "SIM-RECOVERY-REF", replayData);
+            assert(registered.shouldProcess);
+            Transaction transaction = registered.transaction;
+            transactionId = transaction.transactionId;
+            assert(engine.bindSimulatedTerminal(requestId, "SIM-RECOVERY", "PAYBRIDGE_SIMULATED_TERMINAL_V1"));
+            assert(engine.updateStatusForRequest(transaction, TransactionStatus::SENT,
+                requestId, ReplayState::PROCESSING, "SENT", "SIMULATED_REQUEST_SENT", "sent"));
+        }
+        {
+            TransactionEngine recovered(recoveryDb, std::string{});
+            assert(recovered.initialize());
+            const auto aed = recovered.assets().findFiat("AED");
+            assert(aed);
+            const auto duplicate = recovered.createTransaction(
+                paybridge::money::Money{700, aed->decimalPrecision}, *aed,
+                "SIM-RECOVERY-REF", replayData);
+            assert(duplicate.code == ReplayRegistrationCode::IDENTICAL_RETRY);
+            assert(!duplicate.shouldProcess);
+            assert(duplicate.replayState == ReplayState::UNKNOWN);
+            assert(duplicate.transaction.transactionId == transactionId);
+            assert(duplicate.transaction.status == TransactionStatus::UNKNOWN);
+            assert(duplicate.terminalId == "SIM-RECOVERY");
+        }
+    }
+
+    // Existing v1 SQLite databases upgrade in place and retain transaction/replay rows.
+    {
+        const std::string migrationDb = (suiteRoot / "schema_v1_upgrade.sqlite").string();
+        RequestReplayData replayData;
+        replayData.requestId = "4123456789abcdef0123456789abcdef";
+        replayData.canonicalRequestHash = "schema-canonical";
+        replayData.paymentFingerprint = "schema-fingerprint";
+        replayData.requestTimestamp = 1760000000;
+        replayData.requestExpiry = 1760000300;
+        std::string originalId;
+        {
+            TransactionEngine engine(migrationDb, std::string{});
+            assert(engine.initialize());
+            const auto aed = engine.assets().findFiat("AED");
+            assert(aed);
+            const auto registered = engine.createTransaction(
+                paybridge::money::Money{900, aed->decimalPrecision}, *aed,
+                "SCHEMA-UPGRADE-REF", replayData);
+            assert(registered.shouldProcess);
+            originalId = registered.transaction.transactionId;
+        }
+        sqlite3* db = nullptr;
+        assert(sqlite3_open(migrationDb.c_str(), &db) == SQLITE_OK);
+        assert(sqlite3_exec(db,
+            "ALTER TABLE replay_records DROP COLUMN simulation_contract;"
+            "ALTER TABLE replay_records DROP COLUMN terminal_id;"
+            "UPDATE schema_metadata SET metadata_value='1' WHERE metadata_key='schema_version';",
+            nullptr, nullptr, nullptr) == SQLITE_OK);
+        assert(sqlite3_close(db) == SQLITE_OK);
+        {
+            TransactionEngine upgraded(migrationDb, std::string{});
+            assert(upgraded.initialize());
+            const auto aed = upgraded.assets().findFiat("AED");
+            assert(aed);
+            const auto retry = upgraded.createTransaction(
+                paybridge::money::Money{900, aed->decimalPrecision}, *aed,
+                "SCHEMA-UPGRADE-REF", replayData);
+            assert(retry.code == ReplayRegistrationCode::IDENTICAL_RETRY);
+            assert(retry.transaction.transactionId == originalId);
+            assert(retry.terminalId.empty());
+        }
+        assert(sqlite3_open(migrationDb.c_str(), &db) == SQLITE_OK);
+        sqlite3_stmt* version = nullptr;
+        assert(sqlite3_prepare_v2(db,
+            "SELECT metadata_value FROM schema_metadata WHERE metadata_key='schema_version'",
+            -1, &version, nullptr) == SQLITE_OK);
+        assert(sqlite3_step(version) == SQLITE_ROW);
+        assert(std::string(reinterpret_cast<const char*>(sqlite3_column_text(version, 0))) == "2");
+        sqlite3_finalize(version);
+        sqlite3_close(db);
+    }
+
+    const std::string authLog =
+        (suiteRoot / ("transaction_engine_auth_tests_" + testToken + ".csv")).string();
+    TransactionLogger::setFilePath(authLog);
+
+    {
+        TransactionEngine authEngine(testDatabasePath, std::string{});
+        CommunicationManager communication(authEngine, validAuth);
+
+        const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+
+        nlohmann::json paymentJson = {
+            {"protocol_version", "1.0"},
+            {"message_type", "PAYMENT_REQUEST"},
+            {"external_reference", "POS-AUTH-001"},
+            {"request_id", "0123456789abcdef0123456789abcdef"},
+            {"request_timestamp", now},
+            {"request_expiry", now + 300},
+            {"payment", {
+                {"amount", "10.00"},
+                {"asset", {{"type", "FIAT"}, {"code", "AED"}}}
+            }}
+        };
+
+        const std::string payment = paymentJson.dump();
+
+        nlohmann::json validLf = communication.handleRequest(
+            "Authorization: Bearer " + testToken + "\n" + payment);
+        assert(validLf.value("status", "") == "APPROVED");
+
+        const nlohmann::json identicalReplay = communication.handleRequest(
+            "Authorization: Bearer " + testToken + "\n" + payment);
+        assert(identicalReplay.value("status", "") == "APPROVED");
+        assert(identicalReplay.value("transaction_id", "") == validLf.value("transaction_id", ""));
+
+        nlohmann::json alteredReplay = paymentJson;
+        alteredReplay["payment"]["amount"] = "11.00";
+        const nlohmann::json conflictingReplay = communication.handleRequest(
+            "Authorization: Bearer " + testToken + "\n" + alteredReplay.dump());
+        assert(conflictingReplay.value("error_code", "") == "REPLAY_CONFLICT");
+
+        std::cerr << "VALID_LF_RESPONSE=" << validLf.dump() << std::endl;
+
+        std::string paymentCrlf = payment;
+        const std::string lfReference = "POS-AUTH-001";
+        const std::string crlfReference = "POS-AUTH-002";
+        const std::size_t referencePosition = paymentCrlf.find(lfReference);
+        assert(referencePosition != std::string::npos);
+        paymentCrlf.replace(referencePosition, lfReference.size(), crlfReference);
+        const std::string originalRequestId = "0123456789abcdef0123456789abcdef";
+        const std::string secondRequestId = "1123456789abcdef0123456789abcdef";
+        const std::size_t requestIdPosition = paymentCrlf.find(originalRequestId);
+        assert(requestIdPosition != std::string::npos);
+        paymentCrlf.replace(requestIdPosition, originalRequestId.size(), secondRequestId);
+
+        nlohmann::json validCrlf = communication.handleRequest(
+            "Authorization: Bearer " + testToken + "\r\n" + paymentCrlf);
+        assert(validCrlf.value("status", "") == "APPROVED");
+
+        nlohmann::json missing = communication.handleRequest(payment);
+        assert(missing.value("error_code", "") == "AUTH_MISSING");
+
+        nlohmann::json invalid = communication.handleRequest(
+            "Authorization: Bearer " + invalidToken + "\n" + payment);
+        assert(invalid.value("error_code", "") == "AUTH_INVALID");
+
+        nlohmann::json malformed = communication.handleRequest(
+            "Authorization:Basic " + testToken + "\n" + payment);
+        assert(malformed.value("error_code", "") == "AUTH_MALFORMED");
+
+        nlohmann::json duplicate = communication.handleRequest(
+            "Authorization: Bearer " + testToken + " Authorization: Bearer " + testToken + "\n" + payment);
+        assert(duplicate.value("error_code", "") == "AUTH_MALFORMED");
+
+        nlohmann::json legacy = communication.handleRequest(payment);
+        assert(legacy.value("error_code", "") == "AUTH_MISSING");
+
+        nlohmann::json health = communication.handleRequest(
+            "HEALTH_REQUEST JSON");
+        assert(health.size() >= 0);
+
+        nlohmann::json healthJson = communication.handleRequest(
+            "{\"message_type\":\"HEALTH_REQUEST\"}");
+        assert(healthJson.value("message_type", "") == "HEALTH_RESPONSE");
+        assert(healthJson.value("status", "") == "OK");
+        assert(healthJson.value("sensitive", true) == false);
+
+        nlohmann::json healthWithPayment = communication.handleRequest(
+            "Authorization: Bearer " + testToken + "\n" +
+            "{\"message_type\":\"HEALTH_REQUEST\",\"payment\":" + payment + "}");
+        assert(healthWithPayment.value("message_type", "") == "HEALTH_RESPONSE");
+
+        nlohmann::json missingEnvelope = paymentJson;
+        missingEnvelope.erase("request_id");
+
+        nlohmann::json malformedEnvelope = paymentJson;
+        malformedEnvelope["request_id"] = "bad-id";
+
+        nlohmann::json missingTimestampEnvelope = paymentJson;
+        missingTimestampEnvelope.erase("request_timestamp");
+
+        nlohmann::json malformedTimestampEnvelope = paymentJson;
+        malformedTimestampEnvelope["request_timestamp"] = "not-a-timestamp";
+
+        nlohmann::json negativeTimestampEnvelope = paymentJson;
+        negativeTimestampEnvelope["request_timestamp"] = -1;
+
+        nlohmann::json expiryBeforeEnvelope = paymentJson;
+        expiryBeforeEnvelope["request_expiry"] = now - 1;
+
+        nlohmann::json expiryEqualEnvelope = paymentJson;
+        expiryEqualEnvelope["request_expiry"] = now;
+
+        nlohmann::json expiredEnvelope = paymentJson;
+        expiredEnvelope["request_id"] = "1123456789abcdef0123456789abcdef";
+        expiredEnvelope["request_timestamp"] = now - 100;
+        expiredEnvelope["request_expiry"] = now - 1;
+
+        nlohmann::json excessiveEnvelope = paymentJson;
+        excessiveEnvelope["request_id"] = "2123456789abcdef0123456789abcdef";
+        excessiveEnvelope["request_expiry"] = now + 301;
+
+        nlohmann::json futureEnvelope = paymentJson;
+        futureEnvelope["request_id"] = "3123456789abcdef0123456789abcdef";
+        futureEnvelope["request_timestamp"] = now + 305;
+        futureEnvelope["request_expiry"] = now + 306;
+
+        nlohmann::json pastEnvelope = paymentJson;
+        pastEnvelope["request_id"] = "4123456789abcdef0123456789abcdef";
+        pastEnvelope["request_timestamp"] = now - 301;
+        pastEnvelope["request_expiry"] = now - 300;
+
+        nlohmann::json int64MaxEnvelope = paymentJson;
+        int64MaxEnvelope["request_id"] = "5123456789abcdef0123456789abcdef";
+        int64MaxEnvelope["request_timestamp"] = std::numeric_limits<std::int64_t>::max();
+
+        nlohmann::json int64MinEnvelope = paymentJson;
+        int64MinEnvelope["request_id"] = "6123456789abcdef0123456789abcdef";
+        int64MinEnvelope["request_timestamp"] = std::numeric_limits<std::int64_t>::min();
+
+        nlohmann::json unsignedOverflowEnvelope = paymentJson;
+        unsignedOverflowEnvelope["request_id"] = "7123456789abcdef0123456789abcdef";
+        unsignedOverflowEnvelope["request_timestamp"] = std::string("18446744073709551615");
+
+        paybridge::assets::AssetRegistry envelopeRegistry;
+
+        PaymentValidation validEnvelopeResult =
+            JsonHandler::parseAndValidatePaymentRequest(paymentJson.dump(), envelopeRegistry);
+        assert(validEnvelopeResult.valid);
+
+        PaymentValidation missingEnvelopeResult =
+            JsonHandler::parseAndValidatePaymentRequest(missingEnvelope.dump(), envelopeRegistry);
+        assert(!missingEnvelopeResult.valid);
+        assert(missingEnvelopeResult.errorCode == "INVALID_REQUEST_ID");
+
+        PaymentValidation malformedEnvelopeResult =
+            JsonHandler::parseAndValidatePaymentRequest(malformedEnvelope.dump(), envelopeRegistry);
+        assert(!malformedEnvelopeResult.valid);
+        assert(malformedEnvelopeResult.errorCode == "INVALID_REQUEST_ID");
+
+        PaymentValidation missingTimestampResult =
+            JsonHandler::parseAndValidatePaymentRequest(missingTimestampEnvelope.dump(), envelopeRegistry);
+        assert(!missingTimestampResult.valid);
+        assert(missingTimestampResult.errorCode == "INVALID_REQUEST_TIMESTAMP");
+
+        PaymentValidation malformedTimestampResult =
+            JsonHandler::parseAndValidatePaymentRequest(malformedTimestampEnvelope.dump(), envelopeRegistry);
+        assert(!malformedTimestampResult.valid);
+        assert(malformedTimestampResult.errorCode == "INVALID_REQUEST_TIMESTAMP");
+
+        PaymentValidation negativeTimestampResult =
+            JsonHandler::parseAndValidatePaymentRequest(negativeTimestampEnvelope.dump(), envelopeRegistry);
+        assert(!negativeTimestampResult.valid);
+        assert(negativeTimestampResult.errorCode == "INVALID_REQUEST_TIMESTAMP");
+
+        PaymentValidation expiryBeforeResult =
+            JsonHandler::parseAndValidatePaymentRequest(expiryBeforeEnvelope.dump(), envelopeRegistry);
+        assert(!expiryBeforeResult.valid);
+        assert(expiryBeforeResult.errorCode == "INVALID_REQUEST_EXPIRY");
+
+        PaymentValidation expiryEqualResult =
+            JsonHandler::parseAndValidatePaymentRequest(expiryEqualEnvelope.dump(), envelopeRegistry);
+        assert(!expiryEqualResult.valid);
+        assert(expiryEqualResult.errorCode == "INVALID_REQUEST_EXPIRY");
+
+        PaymentValidation expiredEnvelopeResult =
+            JsonHandler::parseAndValidatePaymentRequest(expiredEnvelope.dump(), envelopeRegistry);
+        assert(!expiredEnvelopeResult.valid);
+        assert(expiredEnvelopeResult.errorCode == "REQUEST_EXPIRED");
+
+        PaymentValidation excessiveEnvelopeResult =
+            JsonHandler::parseAndValidatePaymentRequest(excessiveEnvelope.dump(), envelopeRegistry);
+        assert(!excessiveEnvelopeResult.valid);
+        assert(excessiveEnvelopeResult.errorCode == "REQUEST_LIFETIME_EXCEEDED");
+
+        PaymentValidation futureEnvelopeResult =
+            JsonHandler::parseAndValidatePaymentRequest(futureEnvelope.dump(), envelopeRegistry);
+        assert(!futureEnvelopeResult.valid);
+        assert(futureEnvelopeResult.errorCode == "REQUEST_TIMESTAMP_INVALID");
+
+        PaymentValidation pastEnvelopeResult =
+            JsonHandler::parseAndValidatePaymentRequest(pastEnvelope.dump(), envelopeRegistry);
+        assert(!pastEnvelopeResult.valid);
+        assert(pastEnvelopeResult.errorCode == "REQUEST_TIMESTAMP_INVALID");
+
+        PaymentValidation int64MaxResult =
+            JsonHandler::parseAndValidatePaymentRequest(int64MaxEnvelope.dump(), envelopeRegistry);
+        assert(!int64MaxResult.valid);
+        assert(int64MaxResult.errorCode == "REQUEST_LIFETIME_EXCEEDED" ||
+               int64MaxResult.errorCode == "REQUEST_TIMESTAMP_INVALID" ||
+               int64MaxResult.errorCode == "INVALID_REQUEST_EXPIRY");
+
+        PaymentValidation int64MinResult =
+            JsonHandler::parseAndValidatePaymentRequest(int64MinEnvelope.dump(), envelopeRegistry);
+        assert(!int64MinResult.valid);
+        assert(int64MinResult.errorCode == "INVALID_REQUEST_TIMESTAMP");
+
+        unsignedOverflowEnvelope["request_timestamp"] = 18446744073709551615ULL;
+        PaymentValidation unsignedOverflowResult =
+            JsonHandler::parseAndValidatePaymentRequest(unsignedOverflowEnvelope.dump(), envelopeRegistry);
+        assert(!unsignedOverflowResult.valid);
+        assert(unsignedOverflowResult.errorCode == "INVALID_REQUEST_TIMESTAMP");
+
+        nlohmann::json missingExpiryEnvelope = paymentJson;
+        missingExpiryEnvelope.erase("request_expiry");
+
+        nlohmann::json malformedExpiryEnvelope = paymentJson;
+        malformedExpiryEnvelope["request_expiry"] = "not-a-timestamp";
+
+        PaymentValidation missingExpiryResult =
+            JsonHandler::parseAndValidatePaymentRequest(missingExpiryEnvelope.dump(), envelopeRegistry);
+        assert(!missingExpiryResult.valid);
+        assert(missingExpiryResult.errorCode == "INVALID_REQUEST_EXPIRY");
+
+        PaymentValidation malformedExpiryResult =
+            JsonHandler::parseAndValidatePaymentRequest(malformedExpiryEnvelope.dump(), envelopeRegistry);
+        assert(!malformedExpiryResult.valid);
+        assert(malformedExpiryResult.errorCode == "INVALID_REQUEST_EXPIRY");
+    }
+
+    std::cout << "All AuthManager tests passed!" << std::endl;
 
     return 0;
 }

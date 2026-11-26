@@ -1,32 +1,36 @@
-# React + TypeScript + Vite
+# PayBridge Simulation Dashboard
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+The React dashboard reads transactions, terminals, assets, and service health
+from the authenticated PayBridge API. All transaction and terminal data is
+simulation-only. `UNKNOWN` transactions are displayed as unresolved.
 
-Currently, two official plugins are available:
+## Local development
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+Run the backend on `127.0.0.1:5051` and configure the same 64-character
+hexadecimal development bearer token in the backend and in the Vite process.
+In PowerShell, set the non-`VITE_` variable before starting Vite:
 
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+```powershell
+$env:PAYBRIDGE_AUTH_MODE = 'development'
+$env:PAYBRIDGE_DEV_AUTH_TOKEN = '<64-character-hex-token>'
+$env:PAYBRIDGE_DASHBOARD_TOKEN = $env:PAYBRIDGE_DEV_AUTH_TOKEN
+npm run dev
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+Vite binds to `127.0.0.1:5173`, permits only `127.0.0.1` and `localhost`, and
+proxies `/api` to `http://127.0.0.1:5051`. The token is read from the Vite Node
+process and attached to proxied protected requests. It is not compiled into
+frontend assets, read by browser JavaScript, stored in browser storage, or
+returned in API responses. Health requests are forwarded without a token.
+
+The production build is static and does not include a backend proxy. A deployed
+dashboard must use a trusted same-origin server-side proxy that injects
+credentials and protects the API. Do not call the loopback API directly from a
+browser or add the bearer token to a `VITE_` variable.
+
+## Checks
+
+```powershell
+npm test
+npm run build
+```

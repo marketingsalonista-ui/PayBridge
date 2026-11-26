@@ -3,9 +3,14 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <cctype>
+#include <chrono>
+#include <cstdint>
+#include <cstdlib>
+#include <filesystem>
 
 #include "../core/TransactionEngine.h"
 #include "../core/TransactionLogger.h"
+#include "../core/TransactionRepository.h"
 #include "../protocol/JsonHandler.h"
 #include "../money/AmountParser.h"
 #include "../assets/AssetRegistry.h"
@@ -27,7 +32,33 @@ int main()
     for (char& character : assetCode)
         character = static_cast<char>(std::toupper(static_cast<unsigned char>(character)));
 
-    TransactionEngine engine;
+    const char* configuredSimulatorDatabase =
+        std::getenv("PAYBRIDGE_SIMULATOR_DATABASE_PATH");
+    const std::string simulatorDatabasePath =
+        configuredSimulatorDatabase && *configuredSimulatorDatabase
+            ? configuredSimulatorDatabase
+            : "data/paybridge-simulator.db";
+    const char* configuredServerDatabase = std::getenv("PAYBRIDGE_DATABASE_PATH");
+    const std::string serverDatabasePath = configuredServerDatabase && *configuredServerDatabase
+        ? configuredServerDatabase
+        : TransactionRepository::defaultDatabasePath();
+    try
+    {
+        if (std::filesystem::absolute(simulatorDatabasePath).lexically_normal() ==
+            std::filesystem::absolute(serverDatabasePath).lexically_normal())
+        {
+            std::cerr << "[ERROR] Simulator and server must use separate SQLite databases.\n";
+            return 1;
+        }
+    }
+    catch (const std::exception&)
+    {
+        std::cerr << "[ERROR] Could not validate simulator database isolation.\n";
+        return 1;
+    }
+    // Keep simulator state isolated from the server's authoritative database
+    // and legacy CSV source.
+    TransactionEngine engine(simulatorDatabasePath, std::string{});
     paybridge::assets::Asset asset;
 
     if (assetType == "FIAT")
@@ -142,12 +173,53 @@ int main()
     setsockopt(clientSocket, SOL_SOCKET, SO_SNDTIMEO,
                reinterpret_cast<const char*>(&timeout), sizeof(timeout));
 
-    std::string request = JsonHandler::createPaymentRequest(
+    const std::string requestId = JsonHandler::generateRequestId();
+    if (requestId.empty())
+    {
+        engine.updateStatus(transaction, TransactionStatus::FAILED);
+        closesocket(clientSocket);
+        WSACleanup();
+        std::cout << "[ERROR] Could not generate request ID.\n";
+        return 1;
+    }
+
+    const std::int64_t requestTimestamp =
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()
+        ).count();
+    const std::int64_t requestExpiry = requestTimestamp + 300;
+
+    std::string payload = JsonHandler::createPaymentRequest(
         transaction.transactionId,
         externalReference,
         asset,
-        parsed.money
+        parsed.money,
+        requestId,
+        requestTimestamp,
+        requestExpiry
     );
+    nlohmann::json paymentRequest = JsonHandler::parseMessage(payload);
+    paymentRequest["terminal_id"] = "SIM-DEFAULT-001";
+    payload = paymentRequest.dump();
+
+    const char* authMode = std::getenv("PAYBRIDGE_AUTH_MODE");
+    const char* developmentToken = std::getenv("PAYBRIDGE_DEV_AUTH_TOKEN");
+
+    if (!authMode || std::string(authMode) != "development" ||
+        !developmentToken || std::string(developmentToken).empty())
+    {
+        engine.updateStatus(transaction, TransactionStatus::FAILED);
+        closesocket(clientSocket);
+        WSACleanup();
+        std::cout << "[ERROR] Simulator authentication is not configured."
+                  << std::endl;
+        return 1;
+    }
+
+    std::string request = "Authorization: Bearer ";
+    request += developmentToken;
+    request += "\n";
+    request += payload;
     request += "\n";
 
     std::size_t sent = 0;
@@ -177,6 +249,7 @@ int main()
     std::string response;
     char buffer[1024];
     bool complete = false;
+    std::string backendTransactionId;
 
     while (response.size() <= 65536)
     {
@@ -210,20 +283,47 @@ int main()
 
         if (!data.is_object() ||
             data.value("message_type", "") != "PAYMENT_RESPONSE" ||
-            data.value("status", "") == "")
+            data.value("status", "") == "" ||
+            data.value("transaction_id", "").empty() ||
+            data.value("request_id", "") != requestId ||
+            data.value("external_reference", "") != externalReference ||
+            data.value("terminal_id", "") != "SIM-DEFAULT-001" ||
+            !data.value("simulated", false))
         {
             engine.updateStatus(transaction, TransactionStatus::FAILED);
             std::cout << "[ERROR] Invalid payment response.\n";
             return 1;
         }
 
+        // The backend is authoritative for transaction IDs. The simulator's
+        // local SQLite mirror has its own ID because it is a separate store.
+        backendTransactionId = data.value("transaction_id", "");
+
         std::cout << "\nPAYBRIDGE RESPONSE:\n";
         std::cout << data.dump(4) << "\n";
 
-        if (data["status"] == "RECEIVED")
+        const std::string status = data.value("status", "");
+        if (status == "APPROVED" || status == "DECLINED")
         {
-            engine.updateStatus(transaction, TransactionStatus::RECEIVED);
-            std::cout << "[CONFIRMED] Server received the request.\n";
+            if (!engine.updateStatus(transaction, TransactionStatus::RECEIVED))
+            {
+                std::cout << "[ERROR] Could not persist simulated receipt locally.\n";
+                return 1;
+            }
+            const TransactionStatus finalStatus = status == "APPROVED"
+                ? TransactionStatus::APPROVED : TransactionStatus::DECLINED;
+            if (!engine.updateStatus(transaction, finalStatus))
+            {
+                std::cout << "[ERROR] Could not persist simulated result locally.\n";
+                return 1;
+            }
+            std::cout << "[SIMULATED] Terminal result: " << status
+                      << " - no real payment was processed.\n";
+        }
+        else if (status == "UNKNOWN")
+        {
+            engine.updateStatus(transaction, TransactionStatus::UNKNOWN);
+            std::cout << "[SIMULATED] Outcome is UNKNOWN; automatic resend is disabled.\n";
         }
         else
         {
@@ -238,7 +338,10 @@ int main()
     }
 
     std::cout << "\n========== TRANSACTION SUMMARY ==========" << "\n";
-    std::cout << "Transaction ID : " << transaction.transactionId << "\n";
+    std::cout << "Backend Transaction ID : "
+              << (backendTransactionId.empty() ? "Unavailable" : backendTransactionId)
+              << "\n";
+    std::cout << "Simulator Local Record ID : " << transaction.transactionId << "\n";
     std::cout << "External Ref   : " << externalReference << "\n";
     std::cout << "Asset          : " << asset.identityKey() << "\n";
     std::cout << "Amount         : "
@@ -246,9 +349,9 @@ int main()
     std::cout << "Final Status   : "
               << TransactionEngine::statusToString(transaction.status) << "\n";
     std::cout << "=========================================\n";
-    std::cout << "Note: Receipt confirmed, not payment approval.\n";
+    std::cout << "Note: SIMULATED outcome only; no real payment was processed.\n";
 
-    return 0;
+    return transaction.status == TransactionStatus::UNKNOWN ? 2 : 0;
 }
 
 

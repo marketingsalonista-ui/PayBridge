@@ -6,6 +6,7 @@
 *.lib
 *.pdb
 logs/*.csv
+data/*.db*
 .vs/
 
 # Generated CMake files

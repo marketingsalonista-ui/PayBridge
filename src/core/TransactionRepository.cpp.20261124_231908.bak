@@ -1,0 +1,491 @@
+#include "TransactionRepository.h"
+
+#include <filesystem>
+#include <mutex>
+#include <sstream>
+#include <chrono>
+#include <cstdlib>
+
+namespace
+{
+constexpr const char* SCHEMA_VERSION = "1";
+std::mutex databasePathMutex;
+std::string defaultDatabasePathValue = "data/paybridge.db";
+
+int bindText(sqlite3_stmt* statement, int index, const std::string& value)
+{
+    return sqlite3_bind_text(statement, index, value.c_str(),
+                             static_cast<int>(value.size()), SQLITE_TRANSIENT);
+}
+
+std::string sqliteText(sqlite3_stmt* statement, int column)
+{
+    const unsigned char* text = sqlite3_column_text(statement, column);
+    return text ? reinterpret_cast<const char*>(text) : std::string{};
+}
+}
+
+TransactionRepository::TransactionRepository(const std::string& databasePath)
+    : databasePath(databasePath)
+{
+}
+
+TransactionRepository::~TransactionRepository()
+{
+    close();
+}
+
+void TransactionRepository::setDefaultDatabasePath(const std::string& path)
+{
+    std::lock_guard<std::mutex> lock(databasePathMutex);
+    defaultDatabasePathValue = path;
+}
+
+std::string TransactionRepository::defaultDatabasePath()
+{
+    std::lock_guard<std::mutex> lock(databasePathMutex);
+    return defaultDatabasePathValue;
+}
+
+bool TransactionRepository::isInitialized() const noexcept
+{
+    return initialized && database;
+}
+
+bool TransactionRepository::executeSql(const char* sql)
+{
+    char* error = nullptr;
+    const int result = sqlite3_exec(database, sql, nullptr, nullptr, &error);
+
+    if (result != SQLITE_OK)
+    {
+        if (error)
+            sqlite3_free(error);
+        return false;
+    }
+
+    return true;
+}
+
+bool TransactionRepository::executeSchema()
+{
+    const char* schema = R"SQL(
+CREATE TABLE IF NOT EXISTS transactions (
+    transaction_id TEXT PRIMARY KEY NOT NULL CHECK (length(transaction_id) > 0),
+    external_reference TEXT NOT NULL UNIQUE CHECK (length(external_reference) > 0),
+    amount_units INTEGER NOT NULL CHECK (amount_units > 0),
+    money_precision INTEGER NOT NULL CHECK (money_precision >= 0 AND money_precision <= 18),
+    currency TEXT,
+    asset_type TEXT NOT NULL CHECK (asset_type IN ('FIAT', 'DIGITAL_ASSET')),
+    asset_code TEXT NOT NULL CHECK (length(asset_code) > 0),
+    asset_network TEXT,
+    contract_address TEXT,
+    lifecycle_state TEXT NOT NULL CHECK (lifecycle_state IN ('CREATED','SENT','RECEIVED','APPROVED','DECLINED','FAILED','INVALID','UNKNOWN')),
+    legacy_imported INTEGER NOT NULL DEFAULT 0 CHECK (legacy_imported IN (0,1)),
+    created_at_unix INTEGER NOT NULL CHECK (created_at_unix >= 0),
+    updated_at_unix INTEGER NOT NULL CHECK (updated_at_unix >= created_at_unix),
+    UNIQUE (transaction_id, external_reference)
+);
+
+CREATE TABLE IF NOT EXISTS replay_records (
+    request_id TEXT PRIMARY KEY NOT NULL,
+    transaction_id TEXT NOT NULL,
+    external_reference TEXT NOT NULL,
+    canonical_request_hash TEXT NOT NULL,
+    payment_fingerprint TEXT NOT NULL,
+    request_timestamp_unix INTEGER NOT NULL CHECK (request_timestamp_unix >= 0),
+    request_expiry_unix INTEGER NOT NULL CHECK (request_expiry_unix >= 0 AND request_expiry_unix > request_timestamp_unix),
+    replay_state TEXT NOT NULL CHECK (replay_state IN ('RESERVED','PROCESSING','COMPLETED','FAILED','UNKNOWN')),
+    processing_started_at_unix INTEGER,
+    terminal_at_unix INTEGER,
+    response_status TEXT,
+    adapter_result_code TEXT,
+    adapter_message TEXT,
+    unknown_reason TEXT,
+    created_at_unix INTEGER NOT NULL CHECK (created_at_unix >= 0),
+    updated_at_unix INTEGER NOT NULL CHECK (updated_at_unix >= created_at_unix),
+    FOREIGN KEY (transaction_id, external_reference) REFERENCES transactions(transaction_id, external_reference) ON UPDATE RESTRICT ON DELETE RESTRICT
+);
+
+CREATE TABLE IF NOT EXISTS transaction_lifecycle_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    transaction_id TEXT NOT NULL,
+    replay_request_id TEXT,
+    from_status TEXT CHECK (from_status IS NULL OR from_status IN ('CREATED','SENT','RECEIVED','APPROVED','DECLINED','FAILED','INVALID','UNKNOWN')),
+    to_status TEXT NOT NULL CHECK (to_status IN ('CREATED','SENT','RECEIVED','APPROVED','DECLINED','FAILED','INVALID','UNKNOWN')),
+    event_type TEXT NOT NULL CHECK (event_type IN ('RESERVED','LIFECYCLE','ADAPTER_ACCEPTED','ADAPTER_REJECTED','UNKNOWN','LEGACY_IMPORT')),
+    event_time_unix INTEGER NOT NULL CHECK (event_time_unix >= 0),
+    reason TEXT,
+    FOREIGN KEY (transaction_id) REFERENCES transactions(transaction_id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+    FOREIGN KEY (replay_request_id) REFERENCES replay_records(request_id) ON UPDATE RESTRICT ON DELETE RESTRICT
+);
+
+CREATE TABLE IF NOT EXISTS migration_legacy_rows (
+    source_name TEXT NOT NULL,
+    source_row_number INTEGER NOT NULL CHECK (source_row_number >= 1),
+    transaction_id TEXT,
+    external_reference TEXT,
+    amount_units INTEGER,
+    currency TEXT,
+    money_precision INTEGER,
+    asset_type TEXT,
+    asset_code TEXT,
+    asset_network TEXT,
+    contract_address TEXT,
+    lifecycle_state TEXT,
+    raw_record TEXT NOT NULL,
+    raw_record_hash TEXT NOT NULL,
+    PRIMARY KEY (source_name, source_row_number)
+);
+
+CREATE TABLE IF NOT EXISTS migration_batches (
+    batch_id TEXT PRIMARY KEY NOT NULL,
+    source_name TEXT NOT NULL,
+    source_version TEXT NOT NULL,
+    source_row_count INTEGER NOT NULL CHECK (source_row_count >= 0),
+    imported_row_count INTEGER NOT NULL CHECK (imported_row_count >= 0),
+    reconciled_row_count INTEGER NOT NULL CHECK (reconciled_row_count >= 0),
+    conflict_count INTEGER NOT NULL CHECK (conflict_count >= 0),
+    status TEXT NOT NULL CHECK (status IN ('RUNNING','VALIDATED','COMPLETE','FAILED')),
+    source_hash TEXT,
+    started_at_unix INTEGER NOT NULL CHECK (started_at_unix >= 0),
+    completed_at_unix INTEGER CHECK (completed_at_unix IS NULL OR completed_at_unix >= started_at_unix)
+);
+
+CREATE TABLE IF NOT EXISTS schema_metadata (
+    metadata_key TEXT PRIMARY KEY NOT NULL,
+    metadata_value TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_replay_transaction ON replay_records(transaction_id);
+CREATE INDEX IF NOT EXISTS ix_replay_external_reference ON replay_records(external_reference);
+CREATE INDEX IF NOT EXISTS ix_replay_state ON replay_records(replay_state);
+CREATE INDEX IF NOT EXISTS ix_replay_expiry ON replay_records(request_expiry_unix);
+CREATE INDEX IF NOT EXISTS ix_lifecycle_transaction ON transaction_lifecycle_events(transaction_id, event_id);
+CREATE INDEX IF NOT EXISTS ix_lifecycle_request ON transaction_lifecycle_events(replay_request_id);
+CREATE INDEX IF NOT EXISTS ix_migration_external_reference ON migration_legacy_rows(external_reference);
+
+INSERT INTO schema_metadata(metadata_key, metadata_value)
+VALUES ('schema_version', '1')
+ON CONFLICT(metadata_key) DO UPDATE SET metadata_value = excluded.metadata_value;
+)SQL";
+
+    return executeSql(schema);
+}
+
+bool TransactionRepository::initialize()
+{
+    if (database)
+        return isInitialized();
+
+    std::filesystem::path path(databasePath);
+    std::error_code directoryError;
+
+    if (path.has_parent_path())
+        std::filesystem::create_directories(path.parent_path(), directoryError);
+
+    if (directoryError)
+        return false;
+
+    if (sqlite3_open_v2(databasePath.c_str(), &database,
+                        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
+                        nullptr) != SQLITE_OK)
+    {
+        if (database)
+        {
+            sqlite3_close(database);
+            database = nullptr;
+        }
+        return false;
+    }
+
+    // Wrap schema creation and metadata initialization in an explicit migration transaction.
+    const char* migrationTransactionSql = "PRAGMA foreign_keys=OFF; BEGIN TRANSACTION;";
+    if (!executeSql(migrationTransactionSql))
+        return false;
+
+    if (!executeSchema())
+        return false;
+
+    const char* commitTransactionSql = "COMMIT; PRAGMA foreign_keys=ON;";
+    if (!executeSql(commitTransactionSql))
+        return false;
+
+    sqlite3_stmt* statement = nullptr;
+    if (sqlite3_prepare_v2(database,
+                           "SELECT metadata_value FROM schema_metadata WHERE metadata_key = 'schema_version';",
+                           -1, &statement, nullptr) != SQLITE_OK)
+    {
+        return false;
+    }
+
+    const bool versionOk = sqlite3_step(statement) == SQLITE_ROW;
+    const std::string version = versionOk ? sqliteText(statement, 0) : std::string{};
+    sqlite3_finalize(statement);
+
+    if (!versionOk || version != SCHEMA_VERSION)
+    {
+        close();
+        return false;
+    }
+
+    initialized = true;
+    return true;
+}
+
+TransactionRepository::SaveResult TransactionRepository::saveTransaction(const Transaction& transaction)
+{
+    if (!isInitialized() || transaction.transactionId.empty() ||
+        transaction.externalReference.empty() || transaction.money.units <= 0)
+    {
+        return SaveResult::FAILURE;
+    }
+
+    sqlite3_stmt* statement = nullptr;
+    const char* sql = R"SQL(
+INSERT INTO transactions (
+    transaction_id, external_reference, amount_units, money_precision,
+    currency, asset_type, asset_code, asset_network, contract_address,
+    lifecycle_state, legacy_imported, created_at_unix, updated_at_unix
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+ON CONFLICT(external_reference) DO NOTHING;
+)SQL";
+
+    if (sqlite3_prepare_v2(database, sql, -1, &statement, nullptr) != SQLITE_OK)
+        return SaveResult::FAILURE;
+
+    const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    bindText(statement, 1, transaction.transactionId);
+    bindText(statement, 2, transaction.externalReference);
+    sqlite3_bind_int64(statement, 3, transaction.money.units);
+    sqlite3_bind_int(statement, 4, transaction.money.precision);
+
+    if (transaction.asset.isFiat())
+    {
+        sqlite3_bind_text(statement, 5, transaction.currency.c_str(), -1, SQLITE_TRANSIENT);
+        bindText(statement, 6, "FIAT");
+        bindText(statement, 7, transaction.asset.code);
+        sqlite3_bind_null(statement, 8);
+        sqlite3_bind_null(statement, 9);
+    }
+    else
+    {
+        sqlite3_bind_null(statement, 5);
+        bindText(statement, 6, "DIGITAL_ASSET");
+        bindText(statement, 7, transaction.asset.code);
+        bindText(statement, 8, transaction.asset.network);
+        bindText(statement, 9, transaction.asset.contractAddress);
+    }
+
+    bindText(statement, 10, TransactionEngine::statusToString(transaction.status));
+    sqlite3_bind_int64(statement, 11, now);
+    sqlite3_bind_int64(statement, 12, now);
+
+    const bool success = sqlite3_step(statement) == SQLITE_DONE;
+    sqlite3_finalize(statement);
+
+    if (!success)
+        return SaveResult::FAILURE;
+
+    statement = nullptr;
+    const char* eventSql = R"SQL(
+INSERT INTO transaction_lifecycle_events (
+    transaction_id, replay_request_id, from_status, to_status,
+    event_type, event_time_unix, reason
+) VALUES (?, NULL, NULL, ?, 'LIFECYCLE', ?, NULL);
+)SQL";
+
+    if (sqlite3_prepare_v2(database, eventSql, -1, &statement, nullptr) != SQLITE_OK)
+        return SaveResult::FAILURE;
+
+    bindText(statement, 1, transaction.transactionId);
+    bindText(statement, 2, TransactionEngine::statusToString(transaction.status));
+    sqlite3_bind_int64(statement, 3, now);
+
+    const bool eventSuccess = sqlite3_step(statement) == SQLITE_DONE;
+    sqlite3_finalize(statement);
+
+    return eventSuccess ? SaveResult::SUCCESS : SaveResult::FAILURE;
+}
+
+bool TransactionRepository::updateTransactionStatus(const Transaction& transaction)
+{
+    if (!isInitialized() || transaction.transactionId.empty())
+        return false;
+
+    sqlite3_stmt* statement = nullptr;
+
+    // First, retrieve the current status of the transaction.
+    const char* selectSql = "SELECT lifecycle_state FROM transactions WHERE transaction_id = ?;";
+    if (sqlite3_prepare_v2(database, selectSql, -1, &statement, nullptr) != SQLITE_OK)
+        return false;
+
+    bindText(statement, 1, transaction.transactionId);
+
+    TransactionStatus currentStatus = TransactionStatus::UNKNOWN;
+    if (sqlite3_step(statement) == SQLITE_ROW)
+    {
+        const std::string currentStatusStr = sqliteText(statement, 0);
+        if (currentStatusStr == "CREATED") currentStatus = TransactionStatus::CREATED;
+        else if (currentStatusStr == "SENT") currentStatus = TransactionStatus::SENT;
+        else if (currentStatusStr == "RECEIVED") currentStatus = TransactionStatus::RECEIVED;
+        else if (currentStatusStr == "APPROVED") currentStatus = TransactionStatus::APPROVED;
+        else if (currentStatusStr == "DECLINED") currentStatus = TransactionStatus::DECLINED;
+        else if (currentStatusStr == "FAILED") currentStatus = TransactionStatus::FAILED;
+        else if (currentStatusStr == "UNKNOWN") currentStatus = TransactionStatus::INVALID;
+        else
+        {
+            // Invalid current status, handle error (e.g., log it, throw an exception, etc.)
+            sqlite3_finalize(statement);
+            return false;
+        }
+    }
+    else
+    {
+        // Transaction not found, handle error (e.g., log it, throw an exception, etc.)
+        sqlite3_finalize(statement);
+        return false;
+    }
+
+    sqlite3_finalize(statement);
+
+    // Validate the status transition.
+    if (!TransactionEngine::isValidStatusTransition(currentStatus, transaction.status))
+        return false;
+
+    statement = nullptr;
+    const char* sql = "UPDATE transactions SET lifecycle_state = ?, updated_at_unix = ? WHERE transaction_id = ?;";
+
+    if (sqlite3_prepare_v2(database, sql, -1, &statement, nullptr) != SQLITE_OK)
+        return false;
+
+    const std::int64_t now = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    bindText(statement, 1, TransactionEngine::statusToString(transaction.status));
+    sqlite3_bind_int64(statement, 2, now);
+    bindText(statement, 3, transaction.transactionId);
+
+    const bool success = sqlite3_step(statement) == SQLITE_DONE;
+    const bool changed = success && sqlite3_changes(database) == 1;
+    sqlite3_finalize(statement);
+
+    if (!changed)
+        return false;
+
+    statement = nullptr;
+    const char* eventSql = R"SQL(
+INSERT INTO transaction_lifecycle_events (
+    transaction_id, replay_request_id, from_status, to_status,
+    event_type, event_time_unix, reason
+) VALUES (?, NULL, ?, ?, 'LIFECYCLE', ?, NULL);
+)SQL";
+
+    if (sqlite3_prepare_v2(database, eventSql, -1, &statement, nullptr) != SQLITE_OK)
+        return false;
+
+    bindText(statement, 1, transaction.transactionId);
+    bindText(statement, 2, TransactionEngine::statusToString(currentStatus));
+    bindText(statement, 3, TransactionEngine::statusToString(transaction.status));
+    sqlite3_bind_int64(statement, 4, now);
+
+    const bool eventSuccess = sqlite3_step(statement) == SQLITE_DONE;
+    sqlite3_finalize(statement);
+
+    return eventSuccess;
+}
+
+std::vector<Transaction> TransactionRepository::loadTransactions() const
+{
+    std::vector<Transaction> transactions;
+    if (!isInitialized())
+        return transactions;
+
+    sqlite3_stmt* statement = nullptr;
+    const char* sql = R"SQL(
+SELECT transaction_id, external_reference, amount_units, money_precision,
+       currency, asset_type, asset_code, asset_network, contract_address,
+       lifecycle_state
+FROM transactions ORDER BY transaction_id;
+)SQL";
+
+    if (sqlite3_prepare_v2(database, sql, -1, &statement, nullptr) != SQLITE_OK)
+        return transactions;
+
+    while (sqlite3_step(statement) == SQLITE_ROW)
+    {
+        Transaction transaction;
+        transaction.transactionId = sqliteText(statement, 0);
+        transaction.externalReference = sqliteText(statement, 1);
+        transaction.amountMinor = sqlite3_column_int64(statement, 2);
+        transaction.money.units = transaction.amountMinor;
+        transaction.money.precision = static_cast<std::uint8_t>(sqlite3_column_int(statement, 3));
+
+        const std::string assetType = sqliteText(statement, 5);
+        transaction.asset.code = sqliteText(statement, 6);
+
+        if (assetType == "FIAT")
+        {
+            transaction.asset.type = paybridge::assets::AssetType::FIAT;
+            transaction.currency = sqliteText(statement, 4);
+        }
+        else
+        {
+            transaction.asset.type = paybridge::assets::AssetType::DIGITAL_ASSET;
+            transaction.asset.network = sqliteText(statement, 7);
+            transaction.asset.contractAddress = sqliteText(statement, 8);
+        }
+
+        transaction.asset.decimalPrecision = transaction.money.precision;
+
+        const std::string state = sqliteText(statement, 9);
+        if (state == "CREATED") transaction.status = TransactionStatus::CREATED;
+        else if (state == "SENT") transaction.status = TransactionStatus::SENT;
+        else if (state == "RECEIVED") transaction.status = TransactionStatus::RECEIVED;
+        else if (state == "APPROVED") transaction.status = TransactionStatus::APPROVED;
+        else if (state == "DECLINED") transaction.status = TransactionStatus::DECLINED;
+        else if (state == "FAILED") transaction.status = TransactionStatus::FAILED;
+        else if (state == "UNKNOWN") transaction.status = TransactionStatus::INVALID;
+        else
+        {
+            // Invalid state, handle error (e.g., log it, throw an exception, etc.)
+            transaction.status = TransactionStatus::INVALID;
+        }
+
+        transactions.push_back(transaction);
+    }
+
+    sqlite3_finalize(statement);
+    return transactions;
+}
+
+void TransactionRepository::close()
+{
+    if (database)
+    {
+        sqlite3_close(database);
+        database = nullptr;
+    }
+}
+
+bool TransactionRepository::beginTransaction()
+{
+    return executeSql("BEGIN TRANSACTION;");
+}
+
+bool TransactionRepository::commitTransaction()
+{
+    return executeSql("COMMIT;");
+}
+
+bool TransactionRepository::rollbackTransaction()
+{
+    return executeSql("ROLLBACK;");
+}
+
+bool TransactionRepository::pragmaForeignKeys(bool enable)
+{
+    return executeSql(enable ? "PRAGMA foreign_keys = ON;" : "PRAGMA foreign_keys = OFF;");
+}

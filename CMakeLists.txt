@@ -17,6 +17,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
+find_package(SQLite3 REQUIRED)
+find_package(Boost 1.92 CONFIG REQUIRED)
 
 # --------------------------------------------------
 # PayBridge Server
@@ -27,10 +29,14 @@ add_executable(PayBridge
 
     src/core/TransactionEngine.cpp
     src/core/TransactionLogger.cpp
+    src/core/TransactionRepository.cpp
+    src/core/PaymentOrchestrationService.cpp
 
     src/protocol/JsonHandler.cpp
 
     src/communication/CommunicationManager.cpp
+    src/communication/DashboardApiServer.cpp
+    src/security/AuthManager.cpp
 
     src/assets/Asset.cpp
     src/assets/AssetRegistry.cpp
@@ -49,6 +55,8 @@ add_executable(PayBridge
     src/terminal/TerminalManager.cpp
     src/terminal/SimulatedTerminalTransport.cpp
     src/terminal/SimulatedTerminalProtocol.cpp
+    src/terminal/SimulatedTerminalPeer.cpp
+    src/terminal/SimulatedTerminalAdapter.cpp
 )
 
 target_link_libraries(PayBridge
@@ -57,8 +65,12 @@ target_link_libraries(PayBridge
         Threads::Threads
         OpenSSL::SSL
         OpenSSL::Crypto
-        ws2_32
-        ole32
+        SQLite3::SQLite3
+        Boost::headers
+        ws2_32.lib
+        mswsock.lib
+        ole32.lib
+        advapi32.lib
 )
 
 # --------------------------------------------------
@@ -70,8 +82,10 @@ add_executable(PayBridgeSimulator
 
     src/core/TransactionEngine.cpp
     src/core/TransactionLogger.cpp
+    src/core/TransactionRepository.cpp
 
     src/protocol/JsonHandler.cpp
+    src/security/AuthManager.cpp
 
     src/assets/Asset.cpp
     src/assets/AssetRegistry.cpp
@@ -87,6 +101,8 @@ add_executable(PayBridgeSimulator
     src/terminal/TerminalManager.cpp
     src/terminal/SimulatedTerminalTransport.cpp
     src/terminal/SimulatedTerminalProtocol.cpp
+    src/terminal/SimulatedTerminalPeer.cpp
+    src/terminal/SimulatedTerminalAdapter.cpp
 )
 
 target_link_libraries(PayBridgeSimulator
@@ -95,8 +111,10 @@ target_link_libraries(PayBridgeSimulator
         Threads::Threads
         OpenSSL::SSL
         OpenSSL::Crypto
-        ws2_32
-        ole32
+        SQLite3::SQLite3
+        ws2_32.lib
+        ole32.lib
+        advapi32.lib
 )
 
 # --------------------------------------------------
@@ -108,8 +126,16 @@ add_executable(TransactionEngineTests
 
     src/core/TransactionEngine.cpp
     src/core/TransactionLogger.cpp
+    src/core/TransactionRepository.cpp
+    src/core/PaymentOrchestrationService.cpp
 
     src/protocol/JsonHandler.cpp
+
+    src/communication/CommunicationManager.cpp
+    src/security/AuthManager.cpp
+
+    src/adapters/FiatAdapter.cpp
+    src/adapters/DigitalAssetAdapter.cpp
 
     src/assets/Asset.cpp
     src/assets/AssetRegistry.cpp
@@ -125,22 +151,117 @@ add_executable(TransactionEngineTests
     src/terminal/TerminalManager.cpp
     src/terminal/SimulatedTerminalTransport.cpp
     src/terminal/SimulatedTerminalProtocol.cpp
+    src/terminal/SimulatedTerminalPeer.cpp
+    src/terminal/SimulatedTerminalAdapter.cpp
 )
 
 target_link_libraries(TransactionEngineTests
     PRIVATE
+        nlohmann_json::nlohmann_json
         Threads::Threads
-        ole32
-        ws2_32
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        SQLite3::SQLite3
+        ws2_32.lib
+        ole32.lib
+        advapi32.lib
 )
-
-# --------------------------------------------------
-# Testing
-# --------------------------------------------------
 
 enable_testing()
+add_test(NAME TransactionEngineTests COMMAND TransactionEngineTests)
 
-add_test(
-    NAME TransactionEngineTests
-    COMMAND TransactionEngineTests
+add_executable(TerminalAdapterTests
+    tests/TerminalAdapterTests.cpp
+    src/assets/Asset.cpp
+    src/money/Money.cpp
+    src/money/AmountParser.cpp
+    src/transports/TransportResult.cpp
+    src/terminal/TerminalModel.cpp
+    src/terminal/TerminalManager.cpp
+    src/terminal/SimulatedTerminalTransport.cpp
+    src/terminal/SimulatedTerminalProtocol.cpp
+    src/terminal/SimulatedTerminalPeer.cpp
+    src/terminal/SimulatedTerminalAdapter.cpp
 )
+
+target_link_libraries(TerminalAdapterTests
+    PRIVATE
+        Threads::Threads
+)
+
+add_test(NAME TerminalAdapterTests COMMAND TerminalAdapterTests)
+
+add_executable(DashboardApiServerTests
+    tests/DashboardApiServerTests.cpp
+    src/communication/DashboardApiServer.cpp
+    src/core/TransactionEngine.cpp
+    src/core/TransactionLogger.cpp
+    src/core/TransactionRepository.cpp
+    src/assets/Asset.cpp
+    src/assets/AssetRegistry.cpp
+    src/money/Money.cpp
+    src/money/AmountParser.cpp
+    src/security/AuthManager.cpp
+    src/terminal/TerminalModel.cpp
+    src/terminal/TerminalManager.cpp
+    src/terminal/SimulatedTerminalTransport.cpp
+    src/terminal/SimulatedTerminalProtocol.cpp
+    src/terminal/SimulatedTerminalPeer.cpp
+    src/terminal/SimulatedTerminalAdapter.cpp
+    src/transports/TransportResult.cpp
+)
+
+target_link_libraries(DashboardApiServerTests
+    PRIVATE
+        Boost::headers
+        Threads::Threads
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        SQLite3::SQLite3
+        ws2_32.lib
+        mswsock.lib
+        ole32.lib
+        advapi32.lib
+)
+
+add_test(NAME DashboardApiServerTests COMMAND DashboardApiServerTests)
+
+add_executable(TcpServerLifecycleTests
+    tests/TcpServerLifecycleTests.cpp
+    src/core/TransactionEngine.cpp
+    src/core/TransactionLogger.cpp
+    src/core/TransactionRepository.cpp
+    src/core/PaymentOrchestrationService.cpp
+    src/protocol/JsonHandler.cpp
+    src/communication/CommunicationManager.cpp
+    src/security/AuthManager.cpp
+    src/adapters/FiatAdapter.cpp
+    src/adapters/DigitalAssetAdapter.cpp
+    src/assets/Asset.cpp
+    src/assets/AssetRegistry.cpp
+    src/money/Money.cpp
+    src/money/AmountParser.cpp
+    src/transports/TransportResult.cpp
+    src/transports/TcpTransport.cpp
+    src/transports/SerialTransport.cpp
+    src/terminal/TerminalModel.cpp
+    src/terminal/TerminalManager.cpp
+    src/terminal/SimulatedTerminalTransport.cpp
+    src/terminal/SimulatedTerminalProtocol.cpp
+    src/terminal/SimulatedTerminalPeer.cpp
+    src/terminal/SimulatedTerminalAdapter.cpp
+)
+
+target_link_libraries(TcpServerLifecycleTests
+    PRIVATE
+        nlohmann_json::nlohmann_json
+        Threads::Threads
+        OpenSSL::SSL
+        OpenSSL::Crypto
+        SQLite3::SQLite3
+        ws2_32.lib
+        ole32.lib
+        advapi32.lib
+)
+
+add_test(NAME TcpServerLifecycleTests COMMAND TcpServerLifecycleTests)

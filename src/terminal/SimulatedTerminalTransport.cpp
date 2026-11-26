@@ -1,34 +1,37 @@
 #include "SimulatedTerminalTransport.h"
-#include <utility>
-
-#include <cstring>
 
 namespace paybridge::terminal
 {
 
 SimulatedTerminalTransport::SimulatedTerminalTransport(
-    SimulatedTerminalOutcome configuredOutcome)
-    : configuredOutcome(configuredOutcome)
+    SimulatedTerminalOutcome outcome)
+    : peer(makeSimulatedTerminalPeer(outcome))
+{
+}
+
+SimulatedTerminalTransport::SimulatedTerminalTransport(
+    std::shared_ptr<SimulatedTerminalPeer> simulatedPeer)
+    : peer(std::move(simulatedPeer))
 {
 }
 
 transport::TransportResult SimulatedTerminalTransport::open()
 {
     std::lock_guard<std::mutex> lock(mutex);
-
     if (openState)
         return {false, transport::TransportError::ALREADY_OPEN,
-                "Simulated transport is already open"};
-
-    if (configuredOutcome == SimulatedTerminalOutcome::DISCONNECTED)
+            "SIMULATED transport is already open"};
+    if (!peer)
         return {false, transport::TransportError::CONNECT_FAILED,
-                "SIMULATED terminal connection failed"};
-
-    openState = true;
-    hasSentRequest = false;
-    disconnectedAfterReceive = false;
-    return {true, transport::TransportError::NONE,
-            "SIMULATED terminal connected"};
+            "SIMULATED peer is not configured"};
+    const auto result = peer->open();
+    if (result.success)
+    {
+        openState = true;
+        hasSentRequest = false;
+        lastRequest.clear();
+    }
+    return result;
 }
 
 void SimulatedTerminalTransport::close() noexcept
@@ -36,6 +39,7 @@ void SimulatedTerminalTransport::close() noexcept
     std::lock_guard<std::mutex> lock(mutex);
     openState = false;
     hasSentRequest = false;
+    lastRequest.clear();
 }
 
 bool SimulatedTerminalTransport::isOpen() const noexcept
@@ -48,107 +52,39 @@ transport::TransportResult SimulatedTerminalTransport::send(
     const std::vector<std::uint8_t>& bytes)
 {
     std::lock_guard<std::mutex> lock(mutex);
-
     if (!openState)
-        return {false, transport::TransportError::NOT_OPEN,
-                "SIMULATED terminal is not open"};
-
+        return {false, transport::TransportError::NOT_OPEN, "SIMULATED transport is not open"};
     if (bytes.empty())
-        return {false, transport::TransportError::INVALID_ARGUMENT,
-                "SIMULATED terminal request is empty"};
-
+        return {false, transport::TransportError::INVALID_ARGUMENT, "SIMULATED request is empty"};
     if (bytes.size() > 65536)
-        return {false, transport::TransportError::SIZE_LIMIT,
-                "SIMULATED terminal request exceeds size limit"};
-
+        return {false, transport::TransportError::SIZE_LIMIT, "SIMULATED request exceeds size limit"};
+    lastRequest = bytes;
     hasSentRequest = true;
-    return {true, transport::TransportError::NONE,
-            "SIMULATED terminal request sent"};
+    return {true, transport::TransportError::NONE, "SIMULATED bytes accepted"};
 }
 
 transport::TransportBytes SimulatedTerminalTransport::receive(std::size_t maximumBytes)
 {
     std::lock_guard<std::mutex> lock(mutex);
-
     if (!openState)
-    {
-        return {{false, transport::TransportError::NOT_OPEN,
-                 "SIMULATED terminal is not open"}, {}};
-    }
-
+        return {{false, transport::TransportError::NOT_OPEN, "SIMULATED transport is not open"}, {}};
     if (!hasSentRequest)
-    {
-        return {{false, transport::TransportError::INVALID_ARGUMENT,
-                 "No SIMULATED terminal request was sent"}, {}};
-    }
-
-    if (maximumBytes == 0)
-    {
-        return {{false, transport::TransportError::INVALID_ARGUMENT,
-                 "Maximum receive size is zero"}, {}};
-    }
-
-    switch (configuredOutcome)
-    {
-        case SimulatedTerminalOutcome::APPROVED:
-        {
-            static const std::string text =
-                "SIMULATED_RESPONSE APPROVED";
-            std::vector<std::uint8_t> result(text.begin(), text.end());
-            if (result.size() > maximumBytes)
-                return {{false, transport::TransportError::SIZE_LIMIT,
-                         "SIMULATED response exceeds receive limit"}, {}};
-            return {{true, transport::TransportError::NONE,
-                     "SIMULATED approved response"}, std::move(result)};
-        }
-
-        case SimulatedTerminalOutcome::DECLINED:
-        {
-            static const std::string text =
-                "SIMULATED_RESPONSE DECLINED";
-            std::vector<std::uint8_t> result(text.begin(), text.end());
-            if (result.size() > maximumBytes)
-                return {{false, transport::TransportError::SIZE_LIMIT,
-                         "SIMULATED response exceeds receive limit"}, {}};
-            return {{true, transport::TransportError::NONE,
-                     "SIMULATED declined response"}, std::move(result)};
-        }
-
-        case SimulatedTerminalOutcome::TIMEOUT:
-            return {{false, transport::TransportError::TIMEOUT,
-                     "SIMULATED terminal response timed out"}, {}};
-
-        case SimulatedTerminalOutcome::DISCONNECTED:
-            disconnectedAfterReceive = true;
-            openState = false;
-            return {{false, transport::TransportError::DISCONNECTED,
-                     "SIMULATED terminal disconnected"}, {}};
-
-        case SimulatedTerminalOutcome::MALFORMED:
-        {
-            static const std::string text = "%%% MALFORMED-SIMULATION %%%";
-            std::vector<std::uint8_t> result(text.begin(), text.end());
-            if (result.size() > maximumBytes)
-                return {{false, transport::TransportError::SIZE_LIMIT,
-                         "SIMULATED malformed response exceeds receive limit"}, {}};
-            return {{true, transport::TransportError::NONE,
-                     "SIMULATED malformed response"}, std::move(result)};
-        }
-    }
-
-    return {{false, transport::TransportError::MALFORMED_RESPONSE,
-             "Unknown SIMULATED terminal outcome"}, {}};
+        return {{false, transport::TransportError::INVALID_ARGUMENT, "No SIMULATED request was sent"}, {}};
+    if (!peer)
+        return {{false, transport::TransportError::DISCONNECTED, "SIMULATED peer unavailable"}, {}};
+    auto result = peer->respond(lastRequest, maximumBytes);
+    if (result.result.error == transport::TransportError::DISCONNECTED)
+        openState = false;
+    return result;
 }
 
-void SimulatedTerminalTransport::setReceiveTimeoutMilliseconds(
-    std::uint32_t milliseconds) noexcept
+void SimulatedTerminalTransport::setReceiveTimeoutMilliseconds(std::uint32_t milliseconds) noexcept
 {
     std::lock_guard<std::mutex> lock(mutex);
     receiveTimeoutMilliseconds = milliseconds;
 }
 
-void SimulatedTerminalTransport::setSendTimeoutMilliseconds(
-    std::uint32_t milliseconds) noexcept
+void SimulatedTerminalTransport::setSendTimeoutMilliseconds(std::uint32_t milliseconds) noexcept
 {
     std::lock_guard<std::mutex> lock(mutex);
     sendTimeoutMilliseconds = milliseconds;
@@ -156,7 +92,7 @@ void SimulatedTerminalTransport::setSendTimeoutMilliseconds(
 
 std::string SimulatedTerminalTransport::description() const
 {
-    return "SIMULATED Verifone VX 680 profile - no physical protocol";
+    return "SIMULATED byte transport; protocol handled by simulator adapter";
 }
 
 } // namespace paybridge::terminal

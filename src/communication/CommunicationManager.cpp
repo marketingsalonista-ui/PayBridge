@@ -1,7 +1,7 @@
 ﻿#include "CommunicationManager.h"
 #include "../protocol/JsonHandler.h"
-#include "../adapters/FiatAdapter.h"
-#include "../adapters/DigitalAssetAdapter.h"
+#include "../terminal/SimulatedTerminalTransport.h"
+#include "../terminal/SimulatedTerminalAdapter.h"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -12,13 +12,149 @@
 
 #pragma comment(lib, "ws2_32.lib")
 
-CommunicationManager::CommunicationManager(TransactionEngine& engine)
-    : engine(engine)
+namespace
 {
+void configureDefaultSimulatedTerminal(paybridge::terminal::TerminalManager& manager)
+{
+    paybridge::terminal::TerminalModel terminal;
+    terminal.terminalId = "SIM-DEFAULT-001";
+    terminal.manufacturer = "PayBridge";
+    terminal.model = "Simulated Terminal";
+    terminal.description = "Protocol-neutral simulator; no real payment processing";
+    terminal.transportKind = paybridge::terminal::TransportKind::SIMULATED;
+    terminal.adapterId = paybridge::terminal::SimulatedTerminalAdapter::ID;
+    manager.registerAdapter(std::make_shared<paybridge::terminal::SimulatedTerminalAdapter>());
+    manager.registerTerminal(terminal);
+    manager.setTransport(terminal.terminalId,
+        std::make_unique<paybridge::terminal::SimulatedTerminalTransport>(
+            paybridge::terminal::SimulatedTerminalOutcome::APPROVED));
+}
 }
 
-int CommunicationManager::runServer(unsigned short port)
+CommunicationManager::CommunicationManager(TransactionEngine& engine)
+    : engine(engine), authManager(AuthManager::fromEnvironment()),
+      orchestrationService(engine, terminalManager)
 {
+    configureDefaultSimulatedTerminal(terminalManager);
+}
+
+CommunicationManager::CommunicationManager(
+    TransactionEngine& engine,
+    const AuthManager& authManager)
+    : engine(engine), authManager(authManager),
+      orchestrationService(engine, terminalManager)
+{
+    configureDefaultSimulatedTerminal(terminalManager);
+}
+
+nlohmann::json CommunicationManager::handleRequest(const std::string& request) const
+{
+    nlohmann::json response;
+    response["message_type"] = "PAYMENT_RESPONSE";
+    response["status"] = "REJECTED";
+
+    std::string authorizationHeader;
+    std::string payload = request;
+
+    const std::size_t lf = request.find('\n');
+    const std::size_t cr = request.find('\r');
+    const bool crlf = cr != std::string::npos && lf == cr + 1;
+
+    if (lf != std::string::npos || cr != std::string::npos)
+    {
+        const std::size_t lineEnd = crlf ? cr : (lf != std::string::npos ? lf : cr);
+        const std::string firstLine = request.substr(0, lineEnd);
+
+        if (firstLine.rfind("Authorization:", 0) == 0)
+        {
+            authorizationHeader = firstLine;
+            if (crlf)
+                authorizationHeader += '\r';
+
+            const std::size_t payloadStart = crlf ? lf + 1 : lineEnd + 1;
+            payload = payloadStart < request.size() ? request.substr(payloadStart) : std::string{};
+            if (!payload.empty() && payload.back() == '\n') payload.pop_back();
+            if (!payload.empty() && payload.back() == '\r') payload.pop_back();
+        }
+    }
+
+    try
+    {
+        const nlohmann::json health = nlohmann::json::parse(payload);
+        if (health.is_object() && health.value("message_type", "") == "HEALTH_REQUEST")
+        {
+            return nlohmann::json{
+                {"message_type", "HEALTH_RESPONSE"},
+                {"status", "OK"},
+                {"sensitive", false}
+            };
+        }
+    }
+    catch (...) {}
+
+    const auto verification = authManager.verifyAuthorization(authorizationHeader);
+    if (verification == AuthManager::VerificationResult::MISSING)
+    {
+        response["error_code"] = "AUTH_MISSING";
+        response["message"] = "Authentication credentials are required";
+        return response;
+    }
+    if (verification == AuthManager::VerificationResult::MALFORMED)
+    {
+        response["error_code"] = "AUTH_MALFORMED";
+        response["message"] = "Authentication credentials are malformed";
+        return response;
+    }
+    if (verification == AuthManager::VerificationResult::INVALID)
+    {
+        response["error_code"] = "AUTH_INVALID";
+        response["message"] = "Authentication credentials are invalid";
+        return response;
+    }
+    if (verification != AuthManager::VerificationResult::ALLOWED)
+    {
+        response["error_code"] = "AUTH_UNAVAILABLE";
+        response["message"] = "Authentication is unavailable";
+        return response;
+    }
+
+    const auto validation = JsonHandler::parseAndValidatePaymentRequest(payload, engine.assets());
+    if (!validation.valid)
+    {
+        response["error_code"] = validation.errorCode;
+        response["message"] = validation.message;
+        return response;
+    }
+
+    const PaymentOrchestrationResult operation = orchestrationService.process(
+        validation.request, validation.request.terminalId);
+    response["request_id"] = validation.request.envelope.requestId;
+    response["status"] = operation.status;
+    response["transaction_id"] = operation.transactionId;
+    response["external_reference"] = operation.externalReference;
+    response["message"] = operation.message;
+    response["simulated"] = operation.simulated;
+    if (!operation.terminalId.empty()) response["terminal_id"] = operation.terminalId;
+    if (!operation.resultCode.empty()) response["result_code"] = operation.resultCode;
+    if (!operation.errorCode.empty()) response["error_code"] = operation.errorCode;
+    return response;
+}
+
+const paybridge::terminal::TerminalManager& CommunicationManager::terminalManagerReadOnly() const noexcept
+{
+    return terminalManager;
+}
+
+int CommunicationManager::runServer(unsigned short port,
+    const std::atomic_bool* shutdownRequested, std::atomic_ushort* boundPort)
+{
+    if (!authManager.isConfigured())
+    {
+        std::cerr << "[ERROR] Authentication is not configured."
+                  << std::endl;
+        return 1;
+    }
+
     WSADATA wsaData{};
 
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
@@ -71,22 +207,47 @@ int CommunicationManager::runServer(unsigned short port)
         return 1;
     }
 
+    sockaddr_in listeningAddress{};
+    int listeningAddressLength = sizeof(listeningAddress);
+    if (getsockname(serverSocket, reinterpret_cast<sockaddr*>(&listeningAddress),
+            &listeningAddressLength) == 0 && boundPort)
+        boundPort->store(ntohs(listeningAddress.sin_port));
+
     std::cout << "\n====================================\n";
     std::cout << "       PAYBRIDGE TCP SERVER\n";
     std::cout << "====================================\n";
-    std::cout << "[READY] Listening on 127.0.0.1:"
-              << port << "\n";
+    std::cout << "[READY] Listening on 127.0.0.1:" << port << "\n";
     std::cout << "[MODE] Multiple sequential clients\n";
     std::cout << "[INFO] Press Ctrl+C to stop the server.\n";
 
     unsigned long requestCounter = 0;
 
-    while (true)
+    while (!shutdownRequested || !shutdownRequested->load())
     {
+        fd_set readable;
+        FD_ZERO(&readable);
+        FD_SET(serverSocket, &readable);
+        timeval readinessTimeout{};
+        readinessTimeout.tv_sec = 0;
+        readinessTimeout.tv_usec = 250000;
+        const int ready = select(0, &readable, nullptr, nullptr, &readinessTimeout);
+        if (ready == 0)
+            continue;
+        if (ready == SOCKET_ERROR)
+        {
+            if (shutdownRequested && shutdownRequested->load())
+                break;
+            std::cerr << "[ERROR] Listener readiness check failed: "
+                      << WSAGetLastError() << "\n";
+            continue;
+        }
+
         SOCKET clientSocket = accept(serverSocket, nullptr, nullptr);
 
         if (clientSocket == INVALID_SOCKET)
         {
+            if (shutdownRequested && shutdownRequested->load())
+                break;
             std::cerr << "[ERROR] Accept failed: "
                       << WSAGetLastError() << "\n";
             continue;
@@ -123,31 +284,43 @@ int CommunicationManager::runServer(unsigned short port)
 
         while (true)
         {
-            int received = recv(
-                clientSocket,
-                buffer,
-                sizeof(buffer),
-                0
-            );
-
+            int received = recv(clientSocket, buffer, sizeof(buffer), 0);
             if (received <= 0)
                 break;
 
             request.append(buffer, received);
 
-            std::size_t newline = request.find('\n');
-
-            if (newline != std::string::npos)
-            {
-                request.resize(newline);
-                complete = true;
-                break;
-            }
-
             if (request.size() > MAX_MESSAGE_SIZE)
             {
                 tooLarge = true;
                 break;
+            }
+
+            const bool hasHeader = request.rfind("Authorization:", 0) == 0;
+
+            if (hasHeader)
+            {
+                const std::size_t firstNewline = request.find('\n');
+                if (firstNewline != std::string::npos)
+                {
+                    const std::size_t secondNewline = request.find('\n', firstNewline + 1);
+                    if (secondNewline != std::string::npos)
+                    {
+                        request.resize(secondNewline);
+                        complete = true;
+                        break;
+                    }
+                }
+            }
+            else
+            {
+                const std::size_t newline = request.find('\n');
+                if (newline != std::string::npos)
+                {
+                    request.resize(newline);
+                    complete = true;
+                    break;
+                }
             }
         }
 
@@ -157,125 +330,12 @@ int CommunicationManager::runServer(unsigned short port)
 
         if (tooLarge)
         {
+            response["error_code"] = "REQUEST_TOO_LARGE";
             response["message"] = "Request exceeds maximum size";
         }
         else if (complete)
         {
-            const auto validation = JsonHandler::parseAndValidatePaymentRequest(
-                request,
-                engine.assets()
-            );
-
-            if (!validation.valid)
-            {
-                response["error_code"] = validation.errorCode;
-                response["message"] = validation.message;
-                std::cout << "[REJECTED] " << validation.errorCode << "\n";
-            }
-            else
-            {
-                Transaction transaction = engine.createTransaction(
-                    validation.request.money,
-                    validation.request.asset,
-                    validation.request.externalReference
-                );
-
-                if (validation.request.transactionId.empty() == false)
-                {
-                    response["submitted_transaction_id"] =
-                        validation.request.transactionId;
-                }
-
-                if (transaction.status == TransactionStatus::INVALID ||
-                    transaction.status == TransactionStatus::FAILED)
-                {
-                    response["error_code"] = "TRANSACTION_REJECTED";
-                    response["message"] = "Transaction could not be created or retried safely";
-                }
-                else
-                {
-                    if (!validation.request.transactionId.empty() &&
-                        validation.request.transactionId != transaction.transactionId)
-                    {
-                        response["error_code"] = "TRANSACTION_ID_MISMATCH";
-                        response["message"] = "Submitted transaction_id conflicts with the authoritative transaction";
-                    }
-                    else
-                    {
-                        paybridge::adapters::FiatAdapter fiatAdapter;
-                        paybridge::adapters::DigitalAssetAdapter digitalAdapter;
-                        paybridge::adapters::PaymentAdapter* adapter = nullptr;
-
-                        if (transaction.asset.isFiat())
-                            adapter = &fiatAdapter;
-                        else if (transaction.asset.isDigitalAsset())
-                            adapter = &digitalAdapter;
-
-                        if (adapter == nullptr || !adapter->supports(transaction.asset))
-                        {
-                            response["error_code"] = "UNSUPPORTED_ASSET";
-                            response["message"] = "No supported payment adapter is configured for the asset";
-                        }
-                        else
-                        {
-                            if (transaction.status == TransactionStatus::RECEIVED ||
-                                transaction.status == TransactionStatus::APPROVED ||
-                                transaction.status == TransactionStatus::DECLINED)
-                            {
-                                response["status"] = "RECEIVED";
-                                response["transaction_id"] = transaction.transactionId;
-                                response["external_reference"] = transaction.externalReference;
-                                response["message"] =
-                                    "Existing transaction returned; no state transition applied";
-                                response["existing_status"] =
-                                    TransactionEngine::statusToString(transaction.status);
-
-                                std::cout << "[DUPLICATE] Existing transaction returned\n";
-                                std::cout << "[STATUS] "
-                                          << TransactionEngine::statusToString(transaction.status)
-                                          << "\n";
-                            }
-                            else
-                            {
-                                const auto adapterResult = adapter->simulate(
-                                    transaction.asset,
-                                    transaction.money,
-                                    transaction.externalReference
-                                );
-
-                                if (!adapterResult.accepted)
-                                {
-                                    response["error_code"] = "ADAPTER_REJECTED";
-                                    response["message"] = adapterResult.message;
-                                    engine.updateStatus(transaction, TransactionStatus::FAILED);
-                                }
-                                else
-                                {
-                                    if (!engine.updateStatus(transaction, TransactionStatus::SENT) ||
-                                        !engine.updateStatus(transaction, TransactionStatus::RECEIVED))
-                                    {
-                                        response["error_code"] = "PERSISTENCE_FAILURE";
-                                        response["message"] = "Transaction state could not be persisted before receipt";
-                                    }
-                                    else
-                                    {
-                                        response["status"] = "RECEIVED";
-                                        response["transaction_id"] = transaction.transactionId;
-                                        response["external_reference"] = transaction.externalReference;
-                                        response["message"] = adapterResult.message;
-
-                                        std::cout << "[RECEIVED] Payment request\n";
-                                        std::cout << "[TRANSACTION] "
-                                                  << transaction.transactionId << "\n";
-                                        std::cout << "[ASSET] "
-                                                  << transaction.asset.identityKey() << "\n";
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            response = handleRequest(request);
         }
 
         std::string output = response.dump() + "\n";
@@ -283,33 +343,21 @@ int CommunicationManager::runServer(unsigned short port)
 
         while (sent < output.size())
         {
-            int result = send(
-                clientSocket,
-                output.c_str() + sent,
-                static_cast<int>(output.size() - sent),
-                0
-            );
-
+            int result = send(clientSocket, output.c_str() + sent,
+                              static_cast<int>(output.size() - sent), 0);
             if (result == SOCKET_ERROR || result == 0)
             {
                 std::cerr << "[ERROR] Response transmission failed\n";
                 break;
             }
-
             sent += static_cast<std::size_t>(result);
         }
 
-        if (sent == output.size())
-            std::cout << "[SENT] Response returned to client\n";
-
         closesocket(clientSocket);
-
-        std::cout << "[CLOSED] Client connection closed\n";
         std::cout << "[READY] Waiting for next transaction...\n";
     }
 
     closesocket(serverSocket);
     WSACleanup();
-
     return 0;
 }

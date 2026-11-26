@@ -1,0 +1,852 @@
+#include "../src/assets/AssetRegistry.h"
+#include "../src/money/AmountParser.h"
+
+#include "../src/core/TransactionEngine.h"
+#include "../src/core/TransactionLogger.h"
+
+#include "../src/protocol/JsonHandler.h"
+#include "../src/transports/TcpTransport.h"
+#include "../src/transports/SerialTransport.h"
+#include "../src/terminal/TerminalModel.h"
+#include "../src/terminal/TerminalManager.h"
+#include "../src/terminal/SimulatedTerminalTransport.h"
+#include "../src/terminal/SimulatedTerminalProtocol.h"
+#include "../src/security/AuthManager.h"
+#include "../src/communication/CommunicationManager.h"
+
+#include <iostream>
+#include <cassert>
+#include <filesystem>
+#include <fstream>
+#include <thread>
+#include <vector>
+#include <memory>
+#include <string>
+#include <cstdlib>
+
+int main()
+{
+    const std::string testToken = AuthManager::generateBearerToken();
+    assert(!testToken.empty());
+    assert(AuthManager::validateBearerTokenFormat(testToken));
+
+    AuthManager validAuth = AuthManager::fromBearerToken(testToken, AuthManager::Mode::DEVELOPMENT);
+    assert(validAuth.isConfigured());
+    assert(validAuth.verifyAuthorization("Authorization: Bearer " + testToken) ==
+           AuthManager::VerificationResult::ALLOWED);
+    assert(validAuth.verifyAuthorization("") == AuthManager::VerificationResult::MISSING);
+    assert(validAuth.verifyAuthorization("Bearer " + testToken) ==
+           AuthManager::VerificationResult::MALFORMED);
+    assert(validAuth.verifyAuthorization("Authorization: Basic abc") ==
+           AuthManager::VerificationResult::MALFORMED);
+
+    const std::string invalidToken = AuthManager::generateBearerToken();
+    assert(!invalidToken.empty());
+    assert(validAuth.verifyAuthorization("Authorization: Bearer " + invalidToken) ==
+           AuthManager::VerificationResult::INVALID);
+
+    AuthManager unconfigured = AuthManager::fromBearerToken("", AuthManager::Mode::PRODUCTION);
+    assert(!unconfigured.isConfigured());
+    assert(unconfigured.verifyAuthorization("") ==
+           AuthManager::VerificationResult::NOT_CONFIGURED);
+
+    paybridge::assets::AssetRegistry registry;
+
+    const auto usd = registry.findFiat("USD");
+    assert(usd && usd->decimalPrecision == 2);
+
+    const auto jpy = registry.findFiat("JPY");
+    assert(jpy && jpy->decimalPrecision == 0);
+
+    const auto kwd = registry.findFiat("KWD");
+    assert(kwd && kwd->decimalPrecision == 3);
+
+    const auto parsedUsd = paybridge::money::parseAmount("125.50", 2);
+    assert(parsedUsd.success());
+    assert(parsedUsd.money.units == 12550);
+    assert(paybridge::money::formatAmount(parsedUsd.money) == "125.50");
+
+    assert(!paybridge::money::parseAmount("125.501", 2).success());
+    assert(!paybridge::money::parseAmount("-1.00", 2).success());
+    assert(!paybridge::money::parseAmount("0.00", 2).success());
+    assert(!paybridge::money::parseAmount("abc", 2).success());
+
+    assert(registry.registerUsdt("TRON_TESTNET", "CONFIGURED_TEST_CONTRACT", 6));
+    const auto usdt = registry.resolveDigitalAsset(
+        "USDT",
+        "TRON_TESTNET",
+        "CONFIGURED_TEST_CONTRACT"
+    );
+    assert(usdt && usdt->decimalPrecision == 6);
+
+    assert(!registry.resolveDigitalAsset(
+        "USDT",
+        "UNCONFIGURED_NETWORK",
+        "UNCONFIGURED_CONTRACT"
+    ));
+
+    const std::string testLog = "transaction_engine_tests.csv";
+    const std::string blockerPath = "transaction_engine_log_blocker";
+
+    // Use a separate log so production transaction history is untouched.
+    TransactionLogger::setFilePath(testLog);
+    std::filesystem::remove(testLog);
+    std::filesystem::remove_all(blockerPath);
+
+    {
+        TransactionEngine engine;
+
+        // Test 1: Successful payment
+        Transaction approved =
+            engine.createTransaction(10000, "AED", "POS-1001");
+
+        assert(approved.status == TransactionStatus::CREATED);
+        assert(!approved.transactionId.empty());
+
+        assert(engine.updateStatus(approved, TransactionStatus::SENT));
+        assert(engine.updateStatus(approved, TransactionStatus::RECEIVED));
+        assert(engine.updateStatus(approved, TransactionStatus::APPROVED));
+
+        // Test 2: Approved transaction is terminal
+        assert(!engine.updateStatus(approved, TransactionStatus::CREATED));
+        assert(!engine.updateStatus(approved, TransactionStatus::DECLINED));
+
+        // Test 3: Declined payment
+        Transaction declined =
+            engine.createTransaction(5000, "AED", "POS-1002");
+
+        assert(engine.updateStatus(declined, TransactionStatus::SENT));
+        assert(engine.updateStatus(declined, TransactionStatus::RECEIVED));
+        assert(engine.updateStatus(declined, TransactionStatus::DECLINED));
+
+        assert(!engine.updateStatus(declined, TransactionStatus::APPROVED));
+
+        // Test 4: Failed payment
+        Transaction failed =
+            engine.createTransaction(2000, "AED", "POS-1003");
+
+        assert(engine.updateStatus(failed, TransactionStatus::FAILED));
+        assert(!engine.updateStatus(failed, TransactionStatus::SENT));
+
+        // Test 5: Invalid amount
+        Transaction invalidAmount =
+            engine.createTransaction(0, "AED", "POS-1004");
+
+        assert(invalidAmount.status == TransactionStatus::INVALID);
+
+        // Test 6: Invalid currency
+        Transaction invalidCurrency =
+            engine.createTransaction(10000, "abc", "POS-1005");
+
+        assert(invalidCurrency.status == TransactionStatus::INVALID);
+
+        // Test 7: Empty transaction ID
+        Transaction emptyTransaction;
+        assert(!engine.updateStatus(emptyTransaction, TransactionStatus::SENT));
+
+        // Test 8: Invalid transaction cannot progress
+        assert(!engine.updateStatus(invalidAmount, TransactionStatus::SENT));
+
+        // Test 9: Duplicate request returns original transaction
+        Transaction original =
+            engine.createTransaction(7500, "AED", "POS-2001");
+
+        Transaction duplicate =
+            engine.createTransaction(7500, "AED", "POS-2001");
+
+        assert(original.transactionId == duplicate.transactionId);
+        assert(duplicate.status == original.status);
+
+        // Test 10: Same reference with different amount is rejected
+        Transaction amountMismatch =
+            engine.createTransaction(9000, "AED", "POS-2001");
+
+        assert(amountMismatch.status == TransactionStatus::INVALID);
+
+        // Test 11: Same reference with different currency is rejected
+        Transaction currencyMismatch =
+            engine.createTransaction(7500, "USD", "POS-2001");
+
+        assert(currencyMismatch.status == TransactionStatus::INVALID);
+
+        // Test 12: Duplicate retry returns latest stored status
+        assert(engine.updateStatus(original, TransactionStatus::SENT));
+
+        Transaction retry =
+            engine.createTransaction(7500, "AED", "POS-2001");
+
+        assert(retry.transactionId == original.transactionId);
+        assert(retry.status == TransactionStatus::SENT);
+
+        // Test 13: Empty external reference is rejected
+        Transaction emptyReference =
+            engine.createTransaction(1000, "AED", "");
+
+        assert(emptyReference.status == TransactionStatus::INVALID);
+
+        // Test 18: Modified transaction ID is rejected
+        Transaction idCheck =
+            engine.createTransaction(1000, "AED", "POS-SECURITY-001");
+
+        Transaction alteredId = idCheck;
+        alteredId.transactionId = "PB-FAKE-ID";
+
+        assert(!engine.updateStatus(alteredId, TransactionStatus::SENT));
+        assert(idCheck.status == TransactionStatus::CREATED);
+
+        assert(engine.updateStatus(idCheck, TransactionStatus::SENT));
+
+        // Test 19: Modified amount is rejected
+        Transaction amountCheck =
+            engine.createTransaction(2000, "AED", "POS-SECURITY-002");
+
+        Transaction alteredAmount = amountCheck;
+        alteredAmount.amountMinor = 999999;
+
+        assert(!engine.updateStatus(alteredAmount, TransactionStatus::SENT));
+        assert(amountCheck.status == TransactionStatus::CREATED);
+
+        assert(engine.updateStatus(amountCheck, TransactionStatus::SENT));
+
+        // Test 20: Modified currency is rejected
+        Transaction currencyCheck =
+            engine.createTransaction(3000, "AED", "POS-SECURITY-003");
+
+        Transaction alteredCurrency = currencyCheck;
+        alteredCurrency.currency = "USD";
+
+        assert(!engine.updateStatus(alteredCurrency, TransactionStatus::SENT));
+        assert(currencyCheck.status == TransactionStatus::CREATED);
+
+        assert(engine.updateStatus(currencyCheck, TransactionStatus::SENT));
+
+        // Test 21: Stale transaction status is rejected
+        Transaction staleSource =
+            engine.createTransaction(4000, "AED", "POS-SECURITY-004");
+
+        Transaction staleCopy = staleSource;
+
+        assert(engine.updateStatus(staleSource, TransactionStatus::SENT));
+        assert(engine.updateStatus(staleSource, TransactionStatus::RECEIVED));
+
+        // CREATED -> FAILED is normally valid, but this copy is stale.
+        assert(!engine.updateStatus(staleCopy, TransactionStatus::FAILED));
+        assert(staleSource.status == TransactionStatus::RECEIVED);
+
+        // Test 22: Unknown transaction is rejected
+        Transaction unknownTransaction;
+
+        unknownTransaction.transactionId = "PB-UNKNOWN";
+        unknownTransaction.externalReference = "POS-UNKNOWN-001";
+        unknownTransaction.amountMinor = 1000;
+        unknownTransaction.currency = "AED";
+        unknownTransaction.status = TransactionStatus::CREATED;
+
+        assert(!engine.updateStatus(
+            unknownTransaction,
+            TransactionStatus::SENT
+        ));
+    }
+
+    // Test 14: Transaction recovery after engine restart
+    std::string savedTransactionId;
+
+    {
+        TransactionEngine firstEngine;
+
+        Transaction transaction =
+            firstEngine.createTransaction(25000, "AED", "POS-RESTART-001");
+
+        assert(transaction.status == TransactionStatus::CREATED);
+
+        savedTransactionId = transaction.transactionId;
+
+        assert(firstEngine.updateStatus(transaction, TransactionStatus::SENT));
+        assert(firstEngine.updateStatus(transaction, TransactionStatus::RECEIVED));
+        assert(firstEngine.updateStatus(transaction, TransactionStatus::APPROVED));
+    }
+
+    // The first engine has now been destroyed.
+    {
+        TransactionEngine restartedEngine;
+
+        Transaction recovered =
+            restartedEngine.createTransaction(
+                25000, "AED", "POS-RESTART-001"
+            );
+
+        assert(recovered.transactionId == savedTransactionId);
+        assert(recovered.status == TransactionStatus::APPROVED);
+    }
+
+    // Tests 15 and 16: Persistence failure handling
+    {
+        TransactionEngine reliabilityEngine;
+
+        // Create a regular file where the log directory should be.
+        // This deliberately makes log directory creation fail.
+        std::ofstream blocker(blockerPath);
+        assert(blocker.is_open());
+        blocker.close();
+
+        // Test 15: Failed logging must not register a new transaction.
+        TransactionLogger::setFilePath(
+            blockerPath + "/transactions.csv"
+        );
+
+        Transaction failedCreation =
+            reliabilityEngine.createTransaction(
+                3000, "AED", "POS-LOG-FAIL-001"
+            );
+
+        assert(failedCreation.status == TransactionStatus::FAILED);
+
+        // Restore the test log and retry the same external reference.
+        TransactionLogger::setFilePath(testLog);
+
+        Transaction retryCreation =
+            reliabilityEngine.createTransaction(
+                3000, "AED", "POS-LOG-FAIL-001"
+            );
+
+        assert(retryCreation.status == TransactionStatus::CREATED);
+        assert(!retryCreation.transactionId.empty());
+
+        // Test 16: Failed status logging must not change transaction state.
+        TransactionLogger::setFilePath(
+            blockerPath + "/transactions.csv"
+        );
+
+        bool updateResult =
+            reliabilityEngine.updateStatus(
+                retryCreation,
+                TransactionStatus::SENT
+            );
+
+        assert(!updateResult);
+        assert(retryCreation.status == TransactionStatus::CREATED);
+
+        // Restore logging and confirm the same update can now succeed.
+        TransactionLogger::setFilePath(testLog);
+
+        assert(
+            reliabilityEngine.updateStatus(
+                retryCreation,
+                TransactionStatus::SENT
+            )
+        );
+
+        assert(retryCreation.status == TransactionStatus::SENT);
+
+        std::filesystem::remove(blockerPath);
+    }
+
+    // Test 17: Concurrent duplicate transaction requests
+    {
+        TransactionEngine concurrentEngine;
+
+        const int threadCount = 20;
+        const std::string externalReference = "POS-CONCURRENT-001";
+
+        std::vector<Transaction> results(threadCount);
+        std::vector<std::thread> workers;
+
+        for (int i = 0; i < threadCount; ++i)
+        {
+            workers.emplace_back([&, i]()
+            {
+                results[i] = concurrentEngine.createTransaction(
+                    5000,
+                    "AED",
+                    externalReference
+                );
+            });
+        }
+
+        // Wait for all threads to finish.
+        for (auto& worker : workers)
+        {
+            worker.join();
+        }
+
+        // Every request must return the same transaction ID.
+        const std::string firstTransactionId =
+            results[0].transactionId;
+
+        assert(!firstTransactionId.empty());
+
+        for (const auto& result : results)
+        {
+            assert(result.status == TransactionStatus::CREATED);
+            assert(result.transactionId == firstTransactionId);
+        }
+
+        // Verify only one transaction record was created.
+        std::ifstream logFile(testLog);
+        std::string line;
+        int matchingRecords = 0;
+
+        while (std::getline(logFile, line))
+        {
+            if (line.find(externalReference) != std::string::npos)
+            {
+                ++matchingRecords;
+            }
+        }
+
+        assert(matchingRecords == 1);
+
+        std::cout << "Concurrent duplicate request test passed!"
+                  << std::endl;
+    }
+
+    // Test 23: CSV special characters and transaction recovery
+    {
+        TransactionLogger::setFilePath(testLog);
+
+        Transaction specialTransaction;
+
+        specialTransaction.transactionId = "PB-CSV-001";
+        specialTransaction.externalReference =
+            "POS-REF,\"SPECIAL\"\nSECOND-LINE";
+        specialTransaction.amountMinor = 15000;
+        specialTransaction.currency = "AED";
+
+        // Supply complete asset metadata for the 12-column CSV format.
+        specialTransaction.asset.type =
+            paybridge::assets::AssetType::FIAT;
+        specialTransaction.asset.code = "AED";
+        specialTransaction.asset.decimalPrecision = 2;
+
+        specialTransaction.money.units = 15000;
+        specialTransaction.money.precision = 2;
+
+        specialTransaction.status = TransactionStatus::CREATED;
+
+        assert(TransactionLogger::logTransaction(specialTransaction));
+
+        std::vector<Transaction> loaded =
+            TransactionLogger::loadTransactions();
+
+        bool foundSpecialTransaction = false;
+
+        for (const auto& item : loaded)
+        {
+            if (item.transactionId == specialTransaction.transactionId)
+            {
+                assert(
+                    item.externalReference ==
+                    specialTransaction.externalReference
+                );
+
+                foundSpecialTransaction = true;
+                break;
+            }
+        }
+
+        assert(foundSpecialTransaction);
+
+        std::cout
+            << "CSV escaping and recovery test passed!"
+            << std::endl;
+    }
+
+    // Test 24: Malformed CSV records must not affect valid records
+    {
+        const std::string malformedLog =
+            "transaction_engine_malformed_tests.csv";
+
+        TransactionLogger::setFilePath(malformedLog);
+
+        std::filesystem::remove(malformedLog);
+
+        {
+            std::ofstream file(malformedLog, std::ios::binary);
+
+            assert(file.is_open());
+
+            file
+                << "TransactionID,ExternalReference,AmountMinor,"
+                << "Currency,Status,Timestamp,Environment\n";
+
+            // Valid record 1
+            file
+                << "PB-VALID-001,POS-VALID-001,1000,"
+                << "AED,CREATED,2026-11-24,SIMULATION\n";
+
+            // Invalid record: only 5 columns
+            file
+                << "PB-BAD-001,POS-BAD-001,2000,AED,CREATED\n";
+
+            // Invalid record: non-numeric amount
+            file
+                << "PB-BAD-002,POS-BAD-002,INVALID,"
+                << "AED,CREATED,2026-11-24,SIMULATION\n";
+
+            // Valid record 2 after malformed records
+            file
+                << "PB-VALID-002,POS-VALID-002,3000,"
+                << "AED,APPROVED,2026-11-24,SIMULATION\n";
+        }
+
+        std::vector<Transaction> recovered =
+            TransactionLogger::loadTransactions();
+
+        assert(recovered.size() == 2);
+
+        assert(recovered[0].transactionId == "PB-VALID-001");
+        assert(recovered[0].amountMinor == 1000);
+
+        assert(recovered[1].transactionId == "PB-VALID-002");
+        assert(recovered[1].amountMinor == 3000);
+
+        std::cout
+            << "Malformed CSV recovery test passed!"
+            << std::endl;
+
+        TransactionLogger::setFilePath(testLog);
+
+        std::filesystem::remove(malformedLog);
+    }
+
+    // Test 25: Incomplete quoted CSV record at EOF
+    {
+        const std::string incompleteLog =
+            "transaction_engine_incomplete_tests.csv";
+
+        TransactionLogger::setFilePath(incompleteLog);
+
+        std::filesystem::remove(incompleteLog);
+
+        {
+            std::ofstream file(incompleteLog, std::ios::binary);
+
+            assert(file.is_open());
+
+            file
+                << "TransactionID,ExternalReference,AmountMinor,"
+                << "Currency,Status,Timestamp,Environment\n";
+
+            // Valid transaction before the damaged record
+            file
+                << "PB-VALID-EOF-001,POS-VALID-EOF-001,5000,"
+                << "AED,CREATED,2026-11-24,SIMULATION\n";
+
+            // Damaged transaction: closing quotation mark is missing
+            file
+                << "PB-INCOMPLETE-001,\"POS-INCOMPLETE-001,6000,"
+                << "AED,CREATED,2026-11-24,SIMULATION";
+        }
+
+        // Load transactions from the incomplete CSV file.
+        std::vector<Transaction> recovered =
+            TransactionLogger::loadTransactions();
+
+        // Only the valid transaction should be recovered.
+        assert(recovered.size() == 1);
+
+        assert(
+            recovered[0].transactionId == "PB-VALID-EOF-001"
+        );
+
+        assert(
+            recovered[0].externalReference == "POS-VALID-EOF-001"
+        );
+
+        assert(recovered[0].amountMinor == 5000);
+        assert(recovered[0].currency == "AED");
+
+        assert(
+            recovered[0].status == TransactionStatus::CREATED
+        );
+
+        std::cout
+            << "Incomplete CSV EOF recovery test passed!"
+            << std::endl;
+
+        TransactionLogger::setFilePath(testLog);
+
+        std::filesystem::remove(incompleteLog);
+    }
+
+    // P0 regression: existing RECEIVED/APPROVED/DECLINED transactions must not
+    // attempt backward SENT/RECEIVED transitions when retried.
+    {
+        const std::string p0Log =
+            "transaction_engine_p0_regression_tests.csv";
+
+        // Isolate this test from application and previous test history.
+        TransactionLogger::setFilePath(p0Log);
+        std::filesystem::remove(p0Log);
+
+        {
+            TransactionEngine engine;
+
+            Transaction received =
+                engine.createTransaction(7000, "AED", "POS-P0-RECEIVED");
+
+            assert(received.status == TransactionStatus::CREATED);
+            assert(engine.updateStatus(received, TransactionStatus::SENT));
+            assert(engine.updateStatus(received, TransactionStatus::RECEIVED));
+
+            Transaction duplicateReceived =
+                engine.createTransaction(7000, "AED", "POS-P0-RECEIVED");
+
+            assert(duplicateReceived.status == TransactionStatus::RECEIVED);
+            assert(!engine.updateStatus(duplicateReceived, TransactionStatus::SENT));
+
+            Transaction approved =
+                engine.createTransaction(8000, "AED", "POS-P0-APPROVED");
+
+            assert(approved.status == TransactionStatus::CREATED);
+            assert(engine.updateStatus(approved, TransactionStatus::SENT));
+            assert(engine.updateStatus(approved, TransactionStatus::RECEIVED));
+            assert(engine.updateStatus(approved, TransactionStatus::APPROVED));
+
+            Transaction duplicateApproved =
+                engine.createTransaction(8000, "AED", "POS-P0-APPROVED");
+
+            assert(duplicateApproved.status == TransactionStatus::APPROVED);
+            assert(!engine.updateStatus(duplicateApproved, TransactionStatus::RECEIVED));
+
+            Transaction declined =
+                engine.createTransaction(9000, "AED", "POS-P0-DECLINED");
+
+            assert(declined.status == TransactionStatus::CREATED);
+            assert(engine.updateStatus(declined, TransactionStatus::SENT));
+            assert(engine.updateStatus(declined, TransactionStatus::RECEIVED));
+            assert(engine.updateStatus(declined, TransactionStatus::DECLINED));
+
+            Transaction duplicateDeclined =
+                engine.createTransaction(9000, "AED", "POS-P0-DECLINED");
+
+            assert(duplicateDeclined.status == TransactionStatus::DECLINED);
+            assert(!engine.updateStatus(duplicateDeclined, TransactionStatus::RECEIVED));
+        }
+
+        // Remove only the dedicated P0 test log.
+        std::filesystem::remove(p0Log);
+        TransactionLogger::resetFilePath();
+    }
+    // Restore the normal application log path.
+    TransactionLogger::resetFilePath();
+
+    std::cout << "All TransactionEngine tests passed!" << std::endl;
+    std::cout << "Duplicate transaction protection tests passed!" << std::endl;
+    std::cout << "Transaction restart recovery test passed!" << std::endl;
+    std::cout << "Transaction logging failure tests passed!" << std::endl;
+
+    // Terminal transport foundation regressions.
+    {
+        using namespace paybridge::terminal;
+        using namespace paybridge::transport;
+
+        SimulatedTerminalTransport approved(SimulatedTerminalOutcome::APPROVED);
+        assert(approved.open().success);
+
+        const std::vector<std::uint8_t> request = {'S', 'I', 'M'};
+        assert(approved.send(request).success);
+
+        TransportBytes approvedResponse = approved.receive(128);
+        assert(approvedResponse.result.success);
+
+        SimulatedTerminalProtocol protocol;
+        assert(protocol.validateRequest("VX680-DEMO-001", "POS-SIM-001", request));
+        assert(protocol.validateResponse(approvedResponse.data));
+
+        SimulatedTerminalResponse parsed =
+            protocol.parseResponse(approvedResponse.data, "VX680-DEMO-001");
+        assert(parsed.outcome == SimulatedTerminalOutcome::APPROVED);
+        assert(parsed.simulatedResult.find("SIMULATED") != std::string::npos);
+        approved.close();
+        assert(!approved.isOpen());
+
+        SimulatedTerminalTransport declined(SimulatedTerminalOutcome::DECLINED);
+        assert(declined.open().success);
+        assert(declined.send(request).success);
+        TransportBytes declinedResponse = declined.receive(128);
+        assert(declinedResponse.result.success);
+        assert(protocol.validateResponse(declinedResponse.data));
+        parsed = protocol.parseResponse(declinedResponse.data, "VX680-DEMO-001");
+        assert(parsed.outcome == SimulatedTerminalOutcome::DECLINED);
+        declined.close();
+
+        SimulatedTerminalTransport timeout(SimulatedTerminalOutcome::TIMEOUT);
+        timeout.setReceiveTimeoutMilliseconds(50);
+        assert(timeout.open().success);
+        assert(timeout.send(request).success);
+        TransportBytes timeoutResponse = timeout.receive(128);
+        assert(!timeoutResponse.result.success);
+        assert(timeoutResponse.result.error == TransportError::TIMEOUT);
+        timeout.close();
+
+        SimulatedTerminalTransport disconnected(SimulatedTerminalOutcome::DISCONNECTED);
+        assert(!disconnected.open().success);
+
+        SimulatedTerminalTransport malformed(SimulatedTerminalOutcome::MALFORMED);
+        assert(malformed.open().success);
+        assert(malformed.send(request).success);
+        TransportBytes malformedResponse = malformed.receive(128);
+        assert(malformedResponse.result.success);
+        assert(!protocol.validateResponse(malformedResponse.data));
+        parsed = protocol.parseResponse(malformedResponse.data, "VX680-DEMO-001");
+        assert(parsed.outcome == SimulatedTerminalOutcome::MALFORMED);
+        malformed.close();
+
+        assert(!protocol.validateRequest("", "POS-SIM", request));
+        assert(!protocol.validateRequest("VX680-DEMO-001", "", request));
+        assert(!protocol.validateRequest("VX680-DEMO-001", "POS-SIM", {}));
+
+        TerminalManager terminalManager;
+
+        TerminalModel first;
+        first.terminalId = "VX680-DEMO-001";
+        first.transportKind = TransportKind::SIMULATED;
+
+        TerminalModel second;
+        second.terminalId = "VX680-DEMO-002";
+        second.transportKind = TransportKind::SIMULATED;
+
+        terminalManager.registerTerminal(first);
+        terminalManager.registerTerminal(second);
+
+        assert(terminalManager.containsTerminal("VX680-DEMO-001"));
+        assert(terminalManager.containsTerminal("VX680-DEMO-002"));
+        assert(terminalManager.terminals().size() == 2);
+
+        terminalManager.setTransport(
+            "VX680-DEMO-001",
+            std::make_unique<SimulatedTerminalTransport>(
+                SimulatedTerminalOutcome::APPROVED
+            )
+        );
+
+        assert(terminalManager.connect("VX680-DEMO-001").success);
+
+        TransportBytes managerResponse = terminalManager.sendAndReceive(
+            "VX680-DEMO-001",
+            request,
+            128
+        );
+        assert(managerResponse.result.success);
+        assert(protocol.validateResponse(managerResponse.data));
+
+        terminalManager.disconnect("VX680-DEMO-001");
+        assert(!terminalManager.sendAndReceive(
+            "VX680-DEMO-001",
+            request,
+            128
+        ).result.success);
+
+        assert(terminalManager.removeTerminal("VX680-DEMO-001"));
+        assert(!terminalManager.containsTerminal("VX680-DEMO-001"));
+
+        TcpTransport tcpInvalid("not-an-ipv4-address", 5050);
+        assert(tcpInvalid.open().error == TransportError::INVALID_ARGUMENT);
+        assert(!tcpInvalid.isOpen());
+
+        SerialTransport serialInvalid("COM_DOES_NOT_EXIST", 115200);
+        assert(!serialInvalid.open().success);
+        assert(!serialInvalid.isOpen());
+
+        TransportBytes tcpReceiveClosed = tcpInvalid.receive(128);
+        assert(!tcpReceiveClosed.result.success);
+        assert(tcpReceiveClosed.result.error == TransportError::NOT_OPEN);
+
+        TransportBytes serialReceiveClosed = serialInvalid.receive(128);
+        assert(!serialReceiveClosed.result.success);
+        assert(serialReceiveClosed.result.error == TransportError::NOT_OPEN);
+
+        std::cout << "Terminal transport foundation tests passed!" << std::endl;
+    }
+
+    const std::string authLog =
+        "transaction_engine_auth_tests_" + testToken + ".csv";
+    TransactionLogger::setFilePath(authLog);
+
+    {
+        TransactionEngine authEngine;
+        CommunicationManager communication(authEngine, validAuth);
+
+        const std::string payment =
+            "{\"protocol_version\":\"1.0\",\"message_type\":\"PAYMENT_REQUEST\","
+            "\"external_reference\":\"POS-AUTH-001\","
+            "\"payment\":{\"amount\":\"10.00\","
+            "\"asset\":{\"type\":\"FIAT\",\"code\":\"AED\"}}}";
+
+        nlohmann::json validLf = communication.handleRequest(
+            "Authorization: Bearer " + testToken + "\n" + payment);
+        assert(validLf.value("status", "") == "RECEIVED");
+
+        std::cerr << "VALID_LF_RESPONSE=" << validLf.dump() << std::endl;
+
+        nlohmann::json validCrlf = communication.handleRequest(
+            "Authorization: Bearer " + testToken + "\r\n" + payment);
+        assert(validCrlf.value("status", "") == "RECEIVED");
+
+        nlohmann::json missing = communication.handleRequest(payment);
+        assert(missing.value("error_code", "") == "AUTH_MISSING");
+
+        nlohmann::json invalid = communication.handleRequest(
+            "Authorization: Bearer " + invalidToken + "\n" + payment);
+        assert(invalid.value("error_code", "") == "AUTH_INVALID");
+
+        nlohmann::json malformed = communication.handleRequest(
+            "Authorization:Basic " + testToken + "\n" + payment);
+        assert(malformed.value("error_code", "") == "AUTH_MALFORMED");
+
+        nlohmann::json duplicate = communication.handleRequest(
+            "Authorization: Bearer " + testToken + " Authorization: Bearer " + testToken + "\n" + payment);
+        assert(duplicate.value("error_code", "") == "AUTH_MALFORMED");
+
+        nlohmann::json legacy = communication.handleRequest(payment);
+        assert(legacy.value("error_code", "") == "AUTH_MISSING");
+
+        nlohmann::json health = communication.handleRequest(
+            "HEALTH_REQUEST JSON");
+        assert(health.size() >= 0);
+
+        nlohmann::json healthJson = communication.handleRequest(
+            "{\"message_type\":\"HEALTH_REQUEST\"}");
+        assert(healthJson.value("message_type", "") == "HEALTH_RESPONSE");
+        assert(healthJson.value("status", "") == "OK");
+        assert(healthJson.value("sensitive", true) == false);
+
+        nlohmann::json healthWithPayment = communication.handleRequest(
+            "Authorization: Bearer " + testToken + "\n" +
+            "{\"message_type\":\"HEALTH_REQUEST\",\"payment\":" + payment + "}");
+        assert(healthWithPayment.value("message_type", "") == "HEALTH_RESPONSE");
+
+        std::cout << "Communication authentication tests passed!" << std::endl;
+    }
+
+    std::filesystem::remove(authLog);
+    TransactionLogger::resetFilePath();
+
+#ifdef _WIN32
+    _putenv_s("PAYBRIDGE_AUTH_MODE", "unknown-mode");
+    _putenv_s("PAYBRIDGE_DEV_AUTH_TOKEN", testToken.c_str());
+    AuthManager unknownMode = AuthManager::fromEnvironment();
+    assert(!unknownMode.isConfigured());
+
+    _putenv_s("PAYBRIDGE_AUTH_MODE", "production");
+    _putenv_s("PAYBRIDGE_CREDENTIAL_TARGET", "");
+    _putenv_s("PAYBRIDGE_DEV_AUTH_TOKEN", testToken.c_str());
+    AuthManager missingProductionCredential = AuthManager::fromEnvironment();
+    assert(!missingProductionCredential.isConfigured());
+
+    AuthManager invalidFormat = AuthManager::fromBearerToken("too-short", AuthManager::Mode::PRODUCTION);
+    assert(!invalidFormat.isConfigured());
+
+    _putenv_s("PAYBRIDGE_AUTH_MODE", "development");
+    _putenv_s("PAYBRIDGE_DEV_AUTH_TOKEN", testToken.c_str());
+    AuthManager developmentEnvironment = AuthManager::fromEnvironment();
+    assert(developmentEnvironment.isConfigured());
+
+    _putenv_s("PAYBRIDGE_AUTH_MODE", "");
+    _putenv_s("PAYBRIDGE_DEV_AUTH_TOKEN", "");
+    _putenv_s("PAYBRIDGE_CREDENTIAL_TARGET", "");
+#endif
+
+    return 0;
+}

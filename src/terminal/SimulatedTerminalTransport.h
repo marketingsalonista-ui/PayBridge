@@ -2,6 +2,7 @@
 
 #include "../transports/ITransport.h"
 #include "ITerminalProtocol.h"
+#include "SimulatedTerminalPeer.h"
 
 #include <mutex>
 
@@ -12,6 +13,7 @@ class SimulatedTerminalTransport : public transport::ITransport
 {
 public:
     explicit SimulatedTerminalTransport(SimulatedTerminalOutcome configuredOutcome);
+    explicit SimulatedTerminalTransport(std::shared_ptr<SimulatedTerminalPeer> peer);
 
     transport::TransportResult open() override;
     void close() noexcept override;
@@ -29,10 +31,10 @@ private:
     mutable std::mutex mutex;
     bool openState = false;
     bool hasSentRequest = false;
-    bool disconnectedAfterReceive = false;
     std::uint32_t receiveTimeoutMilliseconds = 10000;
     std::uint32_t sendTimeoutMilliseconds = 10000;
-    SimulatedTerminalOutcome configuredOutcome;
+    std::shared_ptr<SimulatedTerminalPeer> peer;
+    std::vector<std::uint8_t> lastRequest;
 };
 
 } // namespace paybridge::terminal

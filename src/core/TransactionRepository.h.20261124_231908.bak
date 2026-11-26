@@ -1,0 +1,60 @@
+#pragma once
+
+#include "TransactionEngine.h"
+
+#include <sqlite3.h>
+#include <string>
+#include <vector>
+#include <mutex> // Include mutex for thread safety
+
+enum class TransactionSaveResult
+{
+    NEW_TRANSACTION,
+    EXISTING_IDENTICAL,
+    CONFLICT,
+    DATABASE_ERROR
+};
+
+class TransactionRepository
+{
+public:
+    explicit TransactionRepository(const std::string& databasePath);
+    ~TransactionRepository();
+
+    TransactionRepository(const TransactionRepository&) = delete;
+    TransactionRepository& operator=(const TransactionRepository&) = delete;
+
+    bool initialize();
+    bool isInitialized() const noexcept;
+
+    TransactionSaveResult saveTransaction(const Transaction& transaction);
+    bool updateTransactionStatus(const Transaction& transaction);
+    std::vector<Transaction> loadTransactions() const;
+
+    static void setDefaultDatabasePath(const std::string& path);
+    static std::string defaultDatabasePath();
+
+    // Explicitly close the database connection
+    void close();
+
+    // Save result API
+    TransactionSaveResult getLastSaveResult() const;
+
+private:
+    std::string databasePath;
+    sqlite3* database = nullptr;
+    bool initialized = false;
+    TransactionSaveResult lastSaveResult = TransactionSaveResult::DATABASE_ERROR; // Default to DATABASE_ERROR
+
+    mutable std::mutex mutex_; // Mutex for protecting repository operations
+    mutable std::mutex dbMutex_; // Mutex for database connection
+
+    bool configureConnection();
+    bool executeSchema();
+    bool executeSql(const char* sql);
+
+    // Integrity and transaction helpers
+    bool beginTransaction();
+    bool commitTransaction();
+    bool rollbackTransaction();
+};

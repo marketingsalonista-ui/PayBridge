@@ -121,6 +121,31 @@ bool AssetRegistry::contains(const Asset& asset) const
            assets.at(asset.identityKey()) == asset;
 }
 
+std::vector<AssetReadModel> AssetRegistry::readModels() const
+{
+    std::lock_guard<std::mutex> lock(mutex);
+    std::vector<AssetReadModel> result;
+    result.reserve(assets.size());
+    for (const auto& [identity, asset] : assets)
+    {
+        (void)identity;
+        result.push_back({asset.code, assetTypeToString(asset.type),
+            asset.decimalPrecision, true});
+    }
+    std::sort(result.begin(), result.end(), [](const auto& left, const auto& right)
+    {
+        if (left.type != right.type) return left.type < right.type;
+        if (left.code != right.code) return left.code < right.code;
+        return left.precision < right.precision;
+    });
+    result.erase(std::unique(result.begin(), result.end(), [](const auto& left, const auto& right)
+    {
+        return left.type == right.type && left.code == right.code &&
+               left.precision == right.precision;
+    }), result.end());
+    return result;
+}
+
 std::optional<Asset> AssetRegistry::findFiat(const std::string& code) const
 {
     if (!upperCaseAscii(code))

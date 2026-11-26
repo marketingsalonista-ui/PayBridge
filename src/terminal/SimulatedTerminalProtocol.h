@@ -3,6 +3,7 @@
 #include "ITerminalProtocol.h"
 
 #include <string>
+#include <optional>
 
 namespace paybridge::terminal
 {
@@ -10,20 +11,30 @@ namespace paybridge::terminal
 class SimulatedTerminalProtocol : public ITerminalProtocol
 {
 public:
-    bool validateRequest(
-        const std::string& terminalId,
-        const std::string& externalReference,
-        const std::vector<std::uint8_t>& payload
-    ) const override;
+    static std::vector<std::uint8_t> encodeRequest(
+        const SimulatedTerminalRequest& request);
+
+    static std::optional<SimulatedTerminalRequest> decodeRequest(
+        const std::vector<std::uint8_t>& payload);
+
+    static std::vector<std::uint8_t> encodeResponse(
+        const SimulatedTerminalRequest& request,
+        SimulatedTerminalOutcome outcome);
+
+    bool validateRequest(const SimulatedTerminalRequest& request,
+        const std::vector<std::uint8_t>& payload) const override;
 
     bool validateResponse(
-        const std::vector<std::uint8_t>& payload
-    ) const override;
+        const std::vector<std::uint8_t>& payload,
+        const SimulatedTerminalRequest& expectedRequest) const override;
 
     static SimulatedTerminalResponse parseResponse(
         const std::vector<std::uint8_t>& payload,
-        const std::string& terminalId
+        const SimulatedTerminalRequest& expectedRequest
     );
+
+    static std::optional<SimulatedTerminalResponse> decodeResponse(
+        const std::vector<std::uint8_t>& payload);
 };
 
 } // namespace paybridge::terminal

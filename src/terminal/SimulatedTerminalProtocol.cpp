@@ -1,59 +1,145 @@
 #include "SimulatedTerminalProtocol.h"
 
-#include <algorithm>
+#include <nlohmann/json.hpp>
 
 namespace paybridge::terminal
 {
+namespace
+{
+using Json = nlohmann::json;
+constexpr const char* CONTRACT = "PAYBRIDGE_SIMULATED_TERMINAL_V1";
+
+bool hasIdentity(const SimulatedTerminalRequest& request)
+{
+    return !request.requestId.empty() && !request.transactionId.empty() &&
+        !request.externalReference.empty() && !request.terminalId.empty() &&
+        !request.amount.empty() && !request.assetIdentity.empty();
+}
+}
+
+std::vector<std::uint8_t> SimulatedTerminalProtocol::encodeRequest(
+    const SimulatedTerminalRequest& request)
+{
+    if (!hasIdentity(request)) return {};
+    const Json data = {
+        {"simulation_contract", CONTRACT}, {"simulated", true},
+        {"request_id", request.requestId}, {"transaction_id", request.transactionId},
+        {"external_reference", request.externalReference}, {"terminal_id", request.terminalId},
+        {"amount", request.amount}, {"asset_identity", request.assetIdentity}
+    };
+    const std::string text = data.dump();
+    return {text.begin(), text.end()};
+}
+
+std::optional<SimulatedTerminalRequest> SimulatedTerminalProtocol::decodeRequest(
+    const std::vector<std::uint8_t>& payload)
+{
+    if (payload.empty() || payload.size() > 65536) return std::nullopt;
+    try
+    {
+        const Json data = Json::parse(payload.begin(), payload.end());
+        if (!data.is_object() ||
+            data.value("simulation_contract", std::string{}) != CONTRACT ||
+            !data.value("simulated", false)) return std::nullopt;
+
+        SimulatedTerminalRequest request;
+        request.requestId = data.at("request_id").get<std::string>();
+        request.transactionId = data.at("transaction_id").get<std::string>();
+        request.externalReference = data.at("external_reference").get<std::string>();
+        request.terminalId = data.at("terminal_id").get<std::string>();
+        request.amount = data.at("amount").get<std::string>();
+        request.assetIdentity = data.at("asset_identity").get<std::string>();
+        if (!hasIdentity(request)) return std::nullopt;
+        return request;
+    }
+    catch (...) { return std::nullopt; }
+}
+
+std::vector<std::uint8_t> SimulatedTerminalProtocol::encodeResponse(
+    const SimulatedTerminalRequest& request,
+    SimulatedTerminalOutcome outcome)
+{
+    if (!hasIdentity(request) ||
+        (outcome != SimulatedTerminalOutcome::APPROVED &&
+         outcome != SimulatedTerminalOutcome::DECLINED))
+        return {};
+    const char* outcomeText = outcome == SimulatedTerminalOutcome::APPROVED
+        ? "APPROVED" : "DECLINED";
+    const Json data = {
+        {"simulation_contract", CONTRACT}, {"simulated", true},
+        {"outcome", outcomeText}, {"request_id", request.requestId},
+        {"transaction_id", request.transactionId},
+        {"external_reference", request.externalReference},
+        {"terminal_id", request.terminalId}
+    };
+    const std::string text = data.dump();
+    return {text.begin(), text.end()};
+}
 
 bool SimulatedTerminalProtocol::validateRequest(
-    const std::string& terminalId,
-    const std::string& externalReference,
+    const SimulatedTerminalRequest& request,
     const std::vector<std::uint8_t>& payload) const
 {
-    if (terminalId.empty() || externalReference.empty() || payload.empty())
-        return false;
+    return !payload.empty() && payload.size() <= 65536 &&
+        encodeRequest(request) == payload;
+}
 
-    if (payload.size() > 65536)
-        return false;
+std::optional<SimulatedTerminalResponse> SimulatedTerminalProtocol::decodeResponse(
+    const std::vector<std::uint8_t>& payload)
+{
+    if (payload.empty() || payload.size() > 65536) return std::nullopt;
+    try
+    {
+        const Json data = Json::parse(payload.begin(), payload.end());
+        if (!data.is_object() || data.value("simulation_contract", std::string{}) != CONTRACT ||
+            !data.value("simulated", false)) return std::nullopt;
 
-    return true;
+        SimulatedTerminalResponse response;
+        const std::string outcome = data.at("outcome").get<std::string>();
+        if (outcome == "APPROVED") response.outcome = SimulatedTerminalOutcome::APPROVED;
+        else if (outcome == "DECLINED") response.outcome = SimulatedTerminalOutcome::DECLINED;
+        else return std::nullopt;
+        response.requestId = data.at("request_id").get<std::string>();
+        response.transactionId = data.at("transaction_id").get<std::string>();
+        response.externalReference = data.at("external_reference").get<std::string>();
+        response.terminalId = data.at("terminal_id").get<std::string>();
+        if (response.requestId.empty() || response.transactionId.empty() ||
+            response.externalReference.empty() || response.terminalId.empty()) return std::nullopt;
+        response.simulatedResult = outcome == "APPROVED"
+            ? "SIMULATED APPROVED - no real payment was processed"
+            : "SIMULATED DECLINED - no real payment was processed";
+        return response;
+    }
+    catch (...) { return std::nullopt; }
 }
 
 bool SimulatedTerminalProtocol::validateResponse(
-    const std::vector<std::uint8_t>& payload) const
+    const std::vector<std::uint8_t>& payload,
+    const SimulatedTerminalRequest& expectedRequest) const
 {
-    const std::string text(payload.begin(), payload.end());
-
-    return text == "SIMULATED_RESPONSE APPROVED" ||
-           text == "SIMULATED_RESPONSE DECLINED";
+    const auto response = decodeResponse(payload);
+    return response && response->requestId == expectedRequest.requestId &&
+        response->transactionId == expectedRequest.transactionId &&
+        response->externalReference == expectedRequest.externalReference &&
+        response->terminalId == expectedRequest.terminalId;
 }
 
 SimulatedTerminalResponse SimulatedTerminalProtocol::parseResponse(
     const std::vector<std::uint8_t>& payload,
-    const std::string& terminalId)
+    const SimulatedTerminalRequest& expectedRequest)
 {
-    const std::string text(payload.begin(), payload.end());
-
-    SimulatedTerminalResponse response;
-    response.terminalId = terminalId;
-
-    if (text == "SIMULATED_RESPONSE APPROVED")
+    const auto response = decodeResponse(payload);
+    if (!response || response->requestId != expectedRequest.requestId ||
+        response->transactionId != expectedRequest.transactionId ||
+        response->externalReference != expectedRequest.externalReference ||
+        response->terminalId != expectedRequest.terminalId)
     {
-        response.outcome = SimulatedTerminalOutcome::APPROVED;
-        response.simulatedResult = "SIMULATED APPROVED - no real payment was processed";
+        SimulatedTerminalResponse malformed;
+        malformed.outcome = SimulatedTerminalOutcome::MALFORMED;
+        malformed.simulatedResult = "INVALID OR UNCORRELATED SIMULATED terminal response";
+        return malformed;
     }
-    else if (text == "SIMULATED_RESPONSE DECLINED")
-    {
-        response.outcome = SimulatedTerminalOutcome::DECLINED;
-        response.simulatedResult = "SIMULATED DECLINED - no real payment was processed";
-    }
-    else
-    {
-        response.outcome = SimulatedTerminalOutcome::MALFORMED;
-        response.simulatedResult = "INVALID SIMULATED terminal response";
-    }
-
-    return response;
+    return *response;
 }
 
 } // namespace paybridge::terminal

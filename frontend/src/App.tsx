@@ -1,14 +1,10 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   Activity,
   Boxes,
-  ChevronDown,
-  ChevronLeft,
   ChevronRight,
   CircleGauge,
-  CreditCard,
   Database,
-  Filter,
   LayoutDashboard,
   LockKeyhole,
   Moon,
@@ -20,20 +16,37 @@ import {
   WalletCards,
   X,
 } from 'lucide-react'
+import { logs } from './data/demo'
 import {
-  Area,
-  AreaChart,
-  CartesianGrid,
-  Cell,
-  Pie,
-  PieChart,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from 'recharts'
-import { assets, logs, statusData, transactions, volumeData } from './data/demo'
-import type { ModuleName, TransactionStatus } from './data/demo'
+  payBridgeApi,
+  PayBridgeApiError,
+} from './services/api'
+import type {
+  AssetDto,
+  HealthResponse,
+  TransactionDto,
+  TransactionStatus,
+  TransactionsResponse,
+} from './services/api'
+
+type ModuleName =
+  | 'Overview'
+  | 'Transactions'
+  | 'POS Terminals'
+  | 'Assets'
+  | 'Adapters'
+  | 'API Protocol'
+  | 'Security'
+  | 'Logs'
+  | 'Settings'
+
+interface ResourceState<T> {
+  data: T | null
+  loading: boolean
+  refreshing: boolean
+  error: string | null
+  lastUpdated: Date | null
+}
 
 const navigation: Array<{ name: ModuleName; icon: typeof LayoutDashboard }> = [
   { name: 'Overview', icon: LayoutDashboard },
@@ -50,38 +63,181 @@ const operations: Array<{ name: ModuleName; icon: typeof LayoutDashboard }> = [
   { name: 'Settings', icon: Settings },
 ]
 
+function useApiResource<T>(
+  loader: (signal: AbortSignal) => Promise<T>,
+  pollingMilliseconds: number | null,
+) {
+  const [revision, setRevision] = useState(0)
+  const [state, setState] = useState<ResourceState<T>>({
+    data: null,
+    loading: true,
+    refreshing: false,
+    error: null,
+    lastUpdated: null,
+  })
+
+  useEffect(() => {
+    let disposed = false
+    let inFlight = false
+    let controller: AbortController | null = null
+
+    const load = async () => {
+      if (disposed || inFlight) return
+      inFlight = true
+      controller = new AbortController()
+      setState((previous) => ({
+        ...previous,
+        loading: previous.data === null,
+        refreshing: previous.data !== null,
+        error: null,
+      }))
+      try {
+        const data = await loader(controller.signal)
+        if (!disposed) {
+          setState({ data, loading: false, refreshing: false, error: null, lastUpdated: new Date() })
+        }
+      } catch (error) {
+        if (!disposed && !controller.signal.aborted) {
+          const message = error instanceof PayBridgeApiError
+            ? error.message
+            : 'Dashboard data could not be loaded.'
+          setState((previous) => ({ ...previous, loading: false, refreshing: false, error: message }))
+        }
+      } finally {
+        inFlight = false
+      }
+    }
+
+    void load()
+    const timer = pollingMilliseconds === null
+      ? null
+      : window.setInterval(() => { void load() }, pollingMilliseconds)
+    return () => {
+      disposed = true
+      if (timer !== null) window.clearInterval(timer)
+      controller?.abort()
+    }
+  }, [loader, pollingMilliseconds, revision])
+
+  return { ...state, retry: () => setRevision((value) => value + 1) }
+}
+
+function formatAmount(units: string, precision: number, code: string): string {
+  const negative = units.startsWith('-')
+  const digits = (negative ? units.slice(1) : units).replace(/^0+(?=\d)/, '')
+  const safePrecision = Math.max(0, Math.min(18, precision))
+  const padded = digits.padStart(safePrecision + 1, '0')
+  const split = safePrecision === 0 ? padded.length : padded.length - safePrecision
+  const whole = padded.slice(0, split).replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+  const fraction = safePrecision === 0 ? '' : `.${padded.slice(split)}`
+  return `${code} ${negative ? '-' : ''}${whole}${fraction}`
+}
+
+function formatTimestamp(timestamp: number): string {
+  return new Date(timestamp * 1000).toLocaleString()
+}
+
+function formatRefresh(timestamp: Date | null): string {
+  return timestamp ? timestamp.toLocaleTimeString() : 'Waiting for first refresh'
+}
+
 function StatusBadge({ status }: { status: TransactionStatus }) {
   const styles: Record<TransactionStatus, string> = {
+    CREATED: 'bg-slate-100 text-slate-700 dark:bg-slate-700/40 dark:text-slate-200',
+    SENT: 'bg-blue-50 text-blue-700 dark:bg-blue-500/10 dark:text-blue-300',
     RECEIVED: 'bg-indigo-50 text-indigo-700 dark:bg-indigo-500/10 dark:text-indigo-300',
     APPROVED: 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300',
     DECLINED: 'bg-amber-50 text-amber-700 dark:bg-amber-500/10 dark:text-amber-300',
     FAILED: 'bg-red-50 text-red-700 dark:bg-red-500/10 dark:text-red-300',
+    INVALID: 'bg-red-50 text-red-700 dark:bg-red-500/10 dark:text-red-300',
+    UNKNOWN: 'bg-orange-50 text-orange-700 dark:bg-orange-500/10 dark:text-orange-300',
   }
+  const label = status === 'UNKNOWN' ? 'UNKNOWN · UNRESOLVED' : status
+  return <span className={`inline-flex whitespace-nowrap rounded-full px-2.5 py-1 text-[11px] font-semibold ${styles[status]}`}>{label}</span>
+}
 
-  return <span className={`rounded-full px-2.5 py-1 text-[11px] font-semibold ${styles[status]}`}>{status}</span>
+function ResourceStateMessage<T>({
+  resource,
+  label,
+  onRetry,
+}: {
+  resource: ResourceState<T>
+  label: string
+  onRetry: () => void
+}) {
+  if (resource.data !== null) {
+    return resource.error ? (
+      <div className="m-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200">
+        <span>Showing the last successful {label}. Refresh failed: {resource.error}</span>
+        <button className="text-button" onClick={onRetry}>Retry</button>
+      </div>
+    ) : null
+  }
+  if (resource.loading) return <div className="p-10 text-center text-sm text-slate-500">Loading {label}…</div>
+  if (resource.error) {
+    return <div className="m-4 rounded-lg border border-red-200 bg-red-50 p-5 text-center dark:border-red-900 dark:bg-red-950/30">
+      <p className="text-sm text-red-700 dark:text-red-300">{resource.error}</p>
+      <button className="secondary-button mt-3" onClick={onRetry}>Retry</button>
+    </div>
+  }
+  return null
+}
+
+function TransactionTable({
+  transactions,
+  onSelect,
+}: {
+  transactions: TransactionDto[]
+  onSelect: (transactionId: string) => void
+}) {
+  return <div className="overflow-x-auto"><table className="data-table">
+    <thead><tr><th>Transaction</th><th>Asset</th><th>Amount</th><th>Status</th><th>Terminal</th><th>Created</th></tr></thead>
+    <tbody>{transactions.map((transaction) => <tr key={transaction.transaction_id}>
+      <td><button className="font-medium text-indigo-600 hover:underline dark:text-indigo-300" onClick={() => onSelect(transaction.transaction_id)}>{transaction.transaction_id}</button></td>
+      <td>{transaction.asset.code}</td>
+      <td className="whitespace-nowrap font-medium">{formatAmount(transaction.amount.units, transaction.amount.precision, transaction.asset.code)}</td>
+      <td><StatusBadge status={transaction.status}/></td>
+      <td>{transaction.terminal_id ?? '—'}</td>
+      <td className="whitespace-nowrap">{formatTimestamp(transaction.created_at_unix)}</td>
+    </tr>)}</tbody>
+  </table></div>
+}
+
+function TransactionDetailPanel({
+  transactionId,
+  onClose,
+}: {
+  transactionId: string
+  onClose: () => void
+}) {
+  const loader = useCallback((signal: AbortSignal) => payBridgeApi.getTransaction(transactionId, signal), [transactionId])
+  const detail = useApiResource(loader, null)
+
+  return <div className="fixed inset-0 z-[70] flex justify-end bg-slate-950/40" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose() }}>
+    <section className="h-full w-full max-w-lg overflow-y-auto bg-white p-6 shadow-xl dark:bg-slate-900" role="dialog" aria-modal="true" aria-labelledby="transaction-detail-title">
+      <div className="flex items-start justify-between gap-4">
+        <div><p className="eyebrow">SIMULATION · TRANSACTION DETAIL</p><h2 id="transaction-detail-title" className="mt-2 break-all text-lg font-semibold">{transactionId}</h2></div>
+        <button className="icon-button" aria-label="Close transaction details" onClick={onClose}><X size={16}/></button>
+      </div>
+      <ResourceStateMessage resource={detail} label="transaction detail" onRetry={detail.retry}/>
+      {detail.data && <dl className="mt-6 grid grid-cols-2 gap-4 text-sm">
+        <div><dt className="text-xs text-slate-400">Status</dt><dd className="mt-1"><StatusBadge status={detail.data.status}/></dd></div>
+        <div><dt className="text-xs text-slate-400">Terminal</dt><dd className="mt-1">{detail.data.terminal_id ?? '—'}</dd></div>
+        <div><dt className="text-xs text-slate-400">Amount</dt><dd className="mt-1 font-medium">{formatAmount(detail.data.amount.units, detail.data.amount.precision, detail.data.asset.code)}</dd></div>
+        <div><dt className="text-xs text-slate-400">Asset type</dt><dd className="mt-1">{detail.data.asset.type}</dd></div>
+        <div><dt className="text-xs text-slate-400">Created</dt><dd className="mt-1">{formatTimestamp(detail.data.created_at_unix)}</dd></div>
+        <div><dt className="text-xs text-slate-400">Updated</dt><dd className="mt-1">{formatTimestamp(detail.data.updated_at_unix)}</dd></div>
+      </dl>}
+    </section>
+  </div>
 }
 
 function ModulePlaceholder({ title }: { title: string }) {
-  return (
-    <section className="panel min-h-[520px] p-6">
-      <div className="mb-6">
-        <p className="eyebrow">Demo module</p>
-        <h1 className="mt-1 text-xl font-semibold text-slate-950 dark:text-white">{title}</h1>
-      </div>
-      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-        {[1, 2, 3].map((item) => (
-          <div key={item} className="rounded-xl border border-slate-200 p-5 dark:border-slate-800">
-            <div className="mb-4 h-10 w-10 rounded-lg bg-slate-100 dark:bg-slate-800" />
-            <div className="h-3 w-28 rounded bg-slate-200 dark:bg-slate-700" />
-            <div className="mt-3 h-2 w-40 rounded bg-slate-100 dark:bg-slate-800" />
-          </div>
-        ))}
-      </div>
-      <div className="mt-5 rounded-xl border border-dashed border-slate-300 p-8 text-center text-sm text-slate-500 dark:border-slate-700">
-        Demo interface — no live PayBridge backend data is connected.
-      </div>
-    </section>
-  )
+  return <section className="panel min-h-[360px] p-6">
+    <p className="eyebrow">SIMULATION · MODULE NOT CONNECTED</p>
+    <h1 className="mt-2 text-xl font-semibold text-slate-950 dark:text-white">{title}</h1>
+    <p className="mt-5 text-sm text-slate-500">This read-only foundation stage does not expose this module.</p>
+  </section>
 }
 
 function App() {
@@ -90,149 +246,162 @@ function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [search, setSearch] = useState('')
   const [statusFilter, setStatusFilter] = useState<'ALL' | TransactionStatus>('ALL')
-  const [page, setPage] = useState(1)
+  const [cursorStack, setCursorStack] = useState<Array<string | null>>([null])
+  const [selectedTransactionId, setSelectedTransactionId] = useState<string | null>(null)
+  const cursor = cursorStack[cursorStack.length - 1] ?? null
+
+  const transactionLoader = useCallback((signal: AbortSignal) => payBridgeApi.getTransactions({
+    limit: 25,
+    status: statusFilter === 'ALL' ? undefined : statusFilter,
+    cursor: cursor ?? undefined,
+  }, signal), [statusFilter, cursor])
+  const transactionsResource = useApiResource<TransactionsResponse>(transactionLoader, 15_000)
+  const terminalLoader = useCallback((signal: AbortSignal) => payBridgeApi.getTerminals(signal), [])
+  const terminalsResource = useApiResource(terminalLoader, 15_000)
+  const assetLoader = useCallback((signal: AbortSignal) => payBridgeApi.getAssets(signal), [])
+  const assetsResource = useApiResource(assetLoader, null)
+  const healthLoader = useCallback((signal: AbortSignal) => payBridgeApi.getHealth(signal), [])
+  const healthResource = useApiResource<HealthResponse>(healthLoader, 30_000)
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', dark)
     localStorage.setItem('paybridge-theme', dark ? 'dark' : 'light')
   }, [dark])
 
-  const filteredTransactions = useMemo(() => {
-    const normalized = search.toLowerCase()
-    return transactions.filter((transaction) => {
-      const matchesSearch = [transaction.id, transaction.reference, transaction.asset, transaction.terminal]
-        .some((value) => value.toLowerCase().includes(normalized))
-      const matchesStatus = statusFilter === 'ALL' || transaction.status === statusFilter
-      return matchesSearch && matchesStatus
-    })
-  }, [search, statusFilter])
+  const mostRecentRefresh = useMemo(() => {
+    const times = [transactionsResource.lastUpdated, terminalsResource.lastUpdated,
+      assetsResource.lastUpdated, healthResource.lastUpdated].filter((value): value is Date => value !== null)
+    return times.length ? new Date(Math.max(...times.map((value) => value.getTime()))) : null
+  }, [transactionsResource.lastUpdated, terminalsResource.lastUpdated, assetsResource.lastUpdated, healthResource.lastUpdated])
 
   const selectModule = (name: ModuleName) => {
     setActive(name)
     setSidebarOpen(false)
   }
 
+  const changeStatusFilter = (value: 'ALL' | TransactionStatus) => {
+    setStatusFilter(value)
+    setCursorStack([null])
+  }
+
+  const visibleTransactions = (transactionsResource.data?.transactions ?? []).filter((transaction) => {
+    const normalized = search.trim().toLowerCase()
+    if (!normalized) return true
+    return [transaction.transaction_id, transaction.asset.code, transaction.terminal_id ?? '', transaction.status]
+      .some((value) => value.toLowerCase().includes(normalized))
+  })
+
+  const transactionDataSection = (limit?: number) => {
+    const data = limit === undefined ? visibleTransactions : visibleTransactions.slice(0, limit)
+    return <>
+      <ResourceStateMessage resource={transactionsResource} label="simulated transactions" onRetry={transactionsResource.retry}/>
+      {transactionsResource.data && data.length > 0 && <TransactionTable transactions={data} onSelect={setSelectedTransactionId}/>}
+      {transactionsResource.data && visibleTransactions.length === 0 && <div className="p-10 text-center text-sm text-slate-500">No simulated transactions match this view.</div>}
+    </>
+  }
+
   const renderModule = () => {
     if (active === 'Overview') {
-      return (
-        <>
-          <div className="mb-6 flex flex-col justify-between gap-3 md:flex-row md:items-end">
-            <div>
-              <p className="eyebrow">Monday, 24 November</p>
-              <h1 className="mt-1 text-2xl font-semibold text-slate-950 dark:text-white">System overview</h1>
-            </div>
-            <button className="secondary-button w-fit"><Filter size={15} /> Last 7 days <ChevronDown size={14} /></button>
-          </div>
-
-          <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-            {[
-              ['Transaction volume', '48,294', '+12.5%', 'AED / demo'],
-              ['Approved', '32,902', '+8.2%', '68.1% of volume'],
-              ['Received', '8,692', '+3.1%', 'Not yet approved'],
-              ['Failed / declined', '6,700', '-1.4%', 'Demo error mix'],
-            ].map(([title, value, change, detail], index) => (
-              <article className="metric-card" key={title}>
-                <div className="mb-5 flex items-center justify-between">
-                  <div className="icon-box">{index === 0 ? <CreditCard size={17} /> : index === 1 ? <ShieldCheck size={17} /> : index === 2 ? <Activity size={17} /> : <LockKeyhole size={17} />}</div>
-                  <span className={index === 3 ? 'metric-neutral' : 'metric-positive'}>{change}</span>
-                </div>
-                <p className="text-xs font-medium text-slate-500 dark:text-slate-400">{title}</p>
-                <p className="mt-1 text-2xl font-semibold text-slate-950 dark:text-white">{value}</p>
-                <p className="mt-2 text-[11px] text-slate-400">{detail}</p>
-              </article>
-            ))}
-          </div>
-
-          <div className="mt-5 grid gap-5 xl:grid-cols-[minmax(0,1.7fr)_minmax(280px,.8fr)]">
-            <section className="panel p-5">
-              <div className="panel-heading">
-                <div><p className="panel-title">Transaction volume</p><p className="panel-subtitle">Demo volume across supported assets</p></div>
-                <button className="secondary-button">Weekly <ChevronDown size={14} /></button>
-              </div>
-              <div className="mt-5 h-[260px]">
-                <ResponsiveContainer width="100%" height="100%">
-                  <AreaChart data={volumeData}>
-                    <defs><linearGradient id="volumeFill" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#5d5fef" stopOpacity={0.22}/><stop offset="95%" stopColor="#5d5fef" stopOpacity={0}/></linearGradient></defs>
-                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#94a3b8" opacity={0.16}/>
-                    <XAxis dataKey="name" axisLine={false} tickLine={false} tick={{ fill:'#94a3b8', fontSize:11 }}/>
-                    <YAxis axisLine={false} tickLine={false} tick={{ fill:'#94a3b8', fontSize:11 }}/>
-                    <Tooltip contentStyle={{ borderRadius:12, border:'1px solid #e2e8f0', fontSize:12 }}/>
-                    <Area type="monotone" dataKey="volume" stroke="#5d5fef" strokeWidth={2.5} fill="url(#volumeFill)" />
-                  </AreaChart>
-                </ResponsiveContainer>
-              </div>
-            </section>
-
-            <section className="panel p-5">
-              <div className="panel-heading"><div><p className="panel-title">Payment status</p><p className="panel-subtitle">Demo distribution</p></div></div>
-              <div className="relative mt-3 h-[210px]">
-                <ResponsiveContainer width="100%" height="100%">
-                  <PieChart><Pie data={statusData} dataKey="value" innerRadius={62} outerRadius={82} paddingAngle={3}>{statusData.map((item) => <Cell key={item.name} fill={item.color}/>)}</Pie><Tooltip /></PieChart>
-                </ResponsiveContainer>
-                <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none"><span className="text-2xl font-semibold">48K</span><span className="text-[11px] text-slate-400">demo total</span></div>
-              </div>
-              <div className="grid grid-cols-2 gap-2">{statusData.map((item) => <div key={item.name} className="flex items-center gap-2 text-xs text-slate-500"><span className="h-2 w-2 rounded-full" style={{ background:item.color }}/>{item.name}<strong className="ml-auto text-slate-800 dark:text-slate-200">{item.value}%</strong></div>)}</div>
-            </section>
-          </div>
-
-          <section className="panel mt-5 overflow-hidden">
-            <div className="panel-heading px-5 py-4"><div><p className="panel-title">Recent transactions</p><p className="panel-subtitle">Clearly labelled demo records</p></div><button className="text-button" onClick={() => selectModule('Transactions')}>View all</button></div>
-            <div className="overflow-x-auto"><table className="data-table"><thead><tr><th>Transaction</th><th>Asset</th><th>Amount</th><th>Status</th><th>Terminal</th><th>Time</th></tr></thead><tbody>{transactions.slice(0,5).map((transaction) => <tr key={transaction.id}><td><div className="font-medium text-slate-900 dark:text-slate-100">{transaction.id}</div><div className="text-[11px] text-slate-400">{transaction.reference}</div></td><td>{transaction.asset}</td><td className="font-medium">{transaction.amount}</td><td><StatusBadge status={transaction.status}/></td><td>{transaction.terminal}</td><td>{transaction.time}</td></tr>)}</tbody></table></div>
-          </section>
-        </>
-      )
+      const rows = transactionsResource.data?.transactions ?? []
+      const approved = rows.filter((row) => row.status === 'APPROVED').length
+      const unresolved = rows.filter((row) => row.status === 'UNKNOWN').length
+      const availableTerminals = terminalsResource.data?.terminals.filter((terminal) => terminal.available).length ?? 0
+      return <>
+        <div className="mb-6 flex flex-col justify-between gap-3 md:flex-row md:items-end">
+          <div><p className="eyebrow">SIMULATED POS MONITORING</p><h1 className="mt-1 text-2xl font-semibold text-slate-950 dark:text-white">System overview</h1></div>
+          <span className="text-xs text-slate-400">Latest successful refresh: {formatRefresh(mostRecentRefresh)}</span>
+        </div>
+        <ResourceStateMessage resource={healthResource} label="service health" onRetry={healthResource.retry}/>
+        <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+          {[
+            ['Transactions on this page', transactionsResource.data?.transactions.length ?? '—', Activity],
+            ['Approved on this page', approved, ShieldCheck],
+            ['Unresolved UNKNOWN', unresolved, LockKeyhole],
+            ['Available terminals', availableTerminals, TerminalSquare],
+          ].map(([title, value, Icon]) => {
+            const MetricIcon = Icon as typeof LayoutDashboard
+            return <article className="metric-card" key={title as string}>
+              <div className="mb-4 icon-box"><MetricIcon size={17}/></div>
+              <p className="text-xs font-medium text-slate-500 dark:text-slate-400">{title as string}</p>
+              <p className="mt-1 text-2xl font-semibold text-slate-950 dark:text-white">{value as string | number}</p>
+            </article>
+          })}
+        </div>
+        {!healthResource.data?.persistence_ready && healthResource.data && <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">SQLite persistence is not ready. Transaction reads may be unavailable.</div>}
+        <section className="panel mt-5 overflow-hidden">
+          <div className="panel-heading px-5 py-4"><div><p className="panel-title">Recent simulated transactions</p><p className="panel-subtitle">SQLite-backed results · current page only</p></div><button className="text-button" onClick={() => selectModule('Transactions')}>View history</button></div>
+          {transactionDataSection(5)}
+        </section>
+      </>
     }
 
     if (active === 'Transactions') {
-      return (
-        <section className="panel overflow-hidden">
-          <div className="px-5 py-5"><p className="eyebrow">Demo transaction ledger</p><h1 className="mt-1 text-xl font-semibold">Transaction monitoring</h1></div>
-          <div className="flex flex-col gap-3 border-y border-slate-100 px-5 py-3 dark:border-slate-800 md:flex-row">
-            <label className="search-box md:max-w-sm"><Search size={15}/><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search ID, reference or terminal"/><button onClick={() => setSearch('')} aria-label="Clear search" className={search ? 'visible' : 'invisible'}><X size={14}/></button></label>
-            <select className="filter-select" value={statusFilter} onChange={(event) => setStatusFilter(event.target.value as 'ALL' | TransactionStatus)}><option value="ALL">All statuses</option><option value="RECEIVED">Received</option><option value="APPROVED">Approved</option><option value="DECLINED">Declined</option><option value="FAILED">Failed</option></select>
-          </div>
-          <div className="overflow-x-auto"><table className="data-table"><thead><tr><th>Transaction</th><th>Asset</th><th>Amount</th><th>Status</th><th>Terminal</th><th>Time</th></tr></thead><tbody>{filteredTransactions.map((transaction) => <tr key={transaction.id}><td><div className="font-medium text-slate-900 dark:text-slate-100">{transaction.id}</div><div className="text-[11px] text-slate-400">{transaction.reference}</div></td><td>{transaction.asset}</td><td className="font-medium">{transaction.amount}</td><td><StatusBadge status={transaction.status}/></td><td>{transaction.terminal}</td><td>{transaction.time}</td></tr>)}</tbody></table></div>
-          {filteredTransactions.length === 0 && <div className="p-10 text-center text-sm text-slate-500">No demo transactions match your filters.</div>}
-          <div className="flex items-center justify-between border-t border-slate-100 px-5 py-3 text-xs text-slate-500 dark:border-slate-800"><span>{filteredTransactions.length} demo records</span><div className="flex items-center gap-2"><button className="icon-button" onClick={() => setPage(Math.max(1, page - 1))}><ChevronLeft size={15}/></button><span>Page {page}</span><button className="icon-button" onClick={() => setPage(page + 1)}><ChevronRight size={15}/></button></div></div>
-        </section>
-      )
+      const response = transactionsResource.data
+      return <section className="panel overflow-hidden">
+        <div className="flex flex-wrap items-end justify-between gap-3 px-5 py-5">
+          <div><p className="eyebrow">SIMULATION · TRANSACTION HISTORY</p><h1 className="mt-1 text-xl font-semibold">Transaction monitoring</h1></div>
+          <span className="text-xs text-slate-400">Last successful refresh: {formatRefresh(transactionsResource.lastUpdated)}</span>
+        </div>
+        <div className="flex flex-col gap-3 border-y border-slate-100 px-5 py-3 dark:border-slate-800 md:flex-row">
+          <label className="search-box md:max-w-sm"><Search size={15}/><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search ID, asset or terminal"/><button onClick={() => setSearch('')} aria-label="Clear search" className={search ? 'visible' : 'invisible'}><X size={14}/></button></label>
+          <select className="filter-select" value={statusFilter} onChange={(event) => changeStatusFilter(event.target.value as 'ALL' | TransactionStatus)}>
+            <option value="ALL">All statuses</option>
+            {(['CREATED', 'SENT', 'RECEIVED', 'APPROVED', 'DECLINED', 'FAILED', 'UNKNOWN', 'INVALID'] as TransactionStatus[]).map((status) => <option value={status} key={status}>{status === 'UNKNOWN' ? 'UNKNOWN · UNRESOLVED' : status}</option>)}
+          </select>
+          {transactionsResource.refreshing && <span className="self-center text-xs text-slate-400">Refreshing…</span>}
+        </div>
+        {transactionDataSection()}
+        {response && <div className="flex items-center justify-between border-t border-slate-100 px-5 py-3 text-xs text-slate-500 dark:border-slate-800">
+          <span>{visibleTransactions.length} result(s) on this page{response.page.has_more ? ' · more available' : ''}</span>
+          <div className="flex items-center gap-2"><button className="secondary-button" disabled={cursorStack.length <= 1} onClick={() => setCursorStack((stack) => stack.slice(0, -1))}>Previous</button><span>Page {cursorStack.length}</span><button className="secondary-button" disabled={!response.page.has_more || !response.page.next_cursor} onClick={() => response.page.next_cursor && setCursorStack((stack) => [...stack, response.page.next_cursor])}>Next</button></div>
+        </div>}
+      </section>
+    }
+
+    if (active === 'POS Terminals') {
+      const terminals = terminalsResource.data?.terminals ?? []
+      return <section className="panel overflow-hidden">
+        <div className="flex flex-wrap items-end justify-between gap-3 px-5 py-5"><div><p className="eyebrow">SIMULATION · READ-ONLY STATUS</p><h1 className="mt-1 text-xl font-semibold">POS terminals</h1></div><span className="text-xs text-slate-400">Last successful refresh: {formatRefresh(terminalsResource.lastUpdated)}</span></div>
+        <ResourceStateMessage resource={terminalsResource} label="terminal status" onRetry={terminalsResource.retry}/>
+        {terminalsResource.data && terminals.length === 0 && <p className="p-10 text-center text-sm text-slate-500">No terminals are configured.</p>}
+        {terminals.length > 0 && <div className="overflow-x-auto"><table className="data-table"><thead><tr><th>Terminal</th><th>Mode</th><th>Configured</th><th>Connection</th><th>Availability</th></tr></thead><tbody>{terminals.map((terminal) => <tr key={terminal.terminal_id}><td className="font-medium">{terminal.terminal_id}</td><td>{terminal.simulated ? 'SIMULATION' : 'NOT SIMULATED'}</td><td>{terminal.configured ? 'Configured' : 'Not configured'}</td><td>{terminal.connection_status}</td><td><span className={terminal.available ? 'text-emerald-600 dark:text-emerald-300' : 'text-slate-400'}>{terminal.available ? 'Available' : 'Unavailable'}</span></td></tr>)}</tbody></table></div>}
+      </section>
     }
 
     if (active === 'Assets') {
-      return <section className="panel overflow-hidden"><div className="px-5 py-5"><p className="eyebrow">Demo registry</p><h1 className="mt-1 text-xl font-semibold">Fiat and digital assets</h1></div><div className="overflow-x-auto"><table className="data-table"><thead><tr><th>Asset</th><th>Type</th><th>Precision</th><th>Configuration</th></tr></thead><tbody>{assets.map((asset) => <tr key={asset.code}><td><div className="font-semibold">{asset.code}</div><div className="text-[11px] text-slate-400">{asset.name}</div></td><td>{asset.type}</td><td>{asset.precision} decimals</td><td><StatusBadge status={asset.status === 'Enabled' ? 'APPROVED' : 'RECEIVED'}/><span className="ml-2 text-xs text-slate-400">{asset.status}</span></td></tr>)}</tbody></table></div></section>
+      const assets = assetsResource.data?.assets ?? []
+      return <section className="panel overflow-hidden">
+        <div className="flex flex-wrap items-end justify-between gap-3 px-5 py-5"><div><p className="eyebrow">SIMULATION · CONFIGURED ASSETS</p><h1 className="mt-1 text-xl font-semibold">Fiat and digital assets</h1></div><span className="text-xs text-slate-400">Last successful refresh: {formatRefresh(assetsResource.lastUpdated)}</span></div>
+        <ResourceStateMessage resource={assetsResource} label="asset registry" onRetry={assetsResource.retry}/>
+        {assetsResource.data && assets.length === 0 && <p className="p-10 text-center text-sm text-slate-500">No assets are configured.</p>}
+        {assets.length > 0 && <div className="overflow-x-auto"><table className="data-table"><thead><tr><th>Asset</th><th>Type</th><th>Precision</th><th>Enabled</th></tr></thead><tbody>{assets.map((asset: AssetDto) => <tr key={`${asset.type}:${asset.code}:${asset.precision}`}><td className="font-semibold">{asset.code}</td><td>{asset.type}</td><td>{asset.precision} decimals</td><td>{asset.enabled ? 'Enabled' : 'Disabled'}</td></tr>)}</tbody></table></div>}
+      </section>
     }
 
     if (active === 'Logs') {
-      return <section className="panel overflow-hidden"><div className="px-5 py-5"><p className="eyebrow">Demo events</p><h1 className="mt-1 text-xl font-semibold">System logs and audit history</h1></div><div className="overflow-x-auto"><table className="data-table"><thead><tr><th>Time</th><th>Level</th><th>Event</th><th>Source</th></tr></thead><tbody>{logs.map((log, index) => <tr key={index}><td>{log.time}</td><td><span className="rounded-full bg-slate-100 px-2 py-1 text-xs dark:bg-slate-800">{log.level}</span></td><td>{log.event}</td><td>{log.source}</td></tr>)}</tbody></table></div></section>
+      return <section className="panel overflow-hidden"><div className="px-5 py-5"><p className="eyebrow">SIMULATION SAMPLE · NOT LIVE EVENTS</p><h1 className="mt-1 text-xl font-semibold">System logs and audit history</h1></div><div className="overflow-x-auto"><table className="data-table"><thead><tr><th>Time</th><th>Level</th><th>Event</th><th>Source</th></tr></thead><tbody>{logs.map((log, index) => <tr key={index}><td>{log.time}</td><td>{log.level}</td><td>{log.event}</td><td>{log.source}</td></tr>)}</tbody></table></div></section>
     }
 
     if (active === 'Settings') {
-      return <section className="panel p-6"><p className="eyebrow">Preferences</p><h1 className="mt-1 text-xl font-semibold">Settings</h1><div className="mt-6 max-w-md rounded-xl border border-slate-200 p-5 dark:border-slate-800"><p className="text-sm font-medium">Appearance</p><p className="mt-1 text-xs text-slate-500">Choose your dashboard theme.</p><div className="mt-4 flex gap-2"><button className={!dark ? 'theme-choice active' : 'theme-choice'} onClick={() => setDark(false)}><Sun size={16}/> Light</button><button className={dark ? 'theme-choice active' : 'theme-choice'} onClick={() => setDark(true)}><Moon size={16}/> Dark</button></div></div></section>
+      return <section className="panel p-6"><p className="eyebrow">Local preference</p><h1 className="mt-1 text-xl font-semibold">Settings</h1><div className="mt-6 max-w-md rounded-xl border border-slate-200 p-5 dark:border-slate-800"><p className="text-sm font-medium">Appearance</p><p className="mt-1 text-xs text-slate-500">Choose your dashboard theme.</p><div className="mt-4 flex gap-2"><button className={!dark ? 'theme-choice active' : 'theme-choice'} onClick={() => setDark(false)}><Sun size={16}/> Light</button><button className={dark ? 'theme-choice active' : 'theme-choice'} onClick={() => setDark(true)}><Moon size={16}/> Dark</button></div></div></section>
     }
 
-    return <ModulePlaceholder title={active} />
+    return <ModulePlaceholder title={active}/>
   }
 
-  return (
-    <div className="min-h-screen bg-slate-50 text-slate-700 dark:bg-[#0b1020] dark:text-slate-300">
-      {sidebarOpen && <button className="fixed inset-0 z-40 bg-slate-950/40 lg:hidden" aria-label="Close navigation" onClick={() => setSidebarOpen(false)} />}
-      <aside className={`sidebar ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'} lg:translate-x-0`}>
-        <div className="flex h-16 items-center px-5"><div className="brand-mark"><Activity size={18}/></div><div className="ml-3"><p className="text-sm font-bold text-slate-950 dark:text-white">PayBridge</p><p className="text-[10px] font-medium text-slate-400">ADMIN CONSOLE</p></div></div>
-        <nav className="px-3 py-4">
-          <p className="nav-label">Workspace</p>
-          {navigation.map((item) => { const Icon = item.icon; return <button key={item.name} className={`nav-item ${active === item.name ? 'active' : ''}`} onClick={() => selectModule(item.name)}><Icon size={17}/><span>{item.name}</span></button> })}
-          <p className="nav-label mt-7">Operations</p>
-          {operations.map((item) => { const Icon = item.icon; return <button key={item.name} className={`nav-item ${active === item.name ? 'active' : ''}`} onClick={() => selectModule(item.name)}><Icon size={17}/><span>{item.name}</span></button> })}
-        </nav>
-        <div className="mt-auto p-3"><div className="mb-3 rounded-xl border border-slate-200 p-3 dark:border-slate-800"><p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Demo environment</p><p className="mt-1 text-xs">Backend not connected</p></div><button className="nav-item"><div className="flex h-7 w-7 items-center justify-center rounded-full bg-indigo-100 text-xs font-bold text-indigo-700">PB</div><span>Demo Operator</span><ChevronDown className="ml-auto" size={14}/></button></div>
-      </aside>
-
-      <main className="lg:ml-[232px]">
-        <header className="topbar"><button className="icon-button lg:hidden" onClick={() => setSidebarOpen(true)}><ChevronRight size={18}/></button><div className="hidden items-center gap-2 text-xs text-slate-400 sm:flex"><span>PayBridge</span><span>/</span><strong className="font-medium text-slate-700 dark:text-slate-200">{active}</strong></div><div className="ml-auto flex items-center gap-2"><span className="demo-badge">DEMO DATA</span><button className="icon-button" onClick={() => setDark((value) => !value)} aria-label="Toggle theme">{dark ? <Sun size={16}/> : <Moon size={16}/>}</button><button className="avatar">PB</button></div></header>
-        <div className="mx-auto max-w-[1440px] p-4 md:p-6">{renderModule()}</div>
-      </main>
-    </div>
-  )
+  return <div className="min-h-screen bg-slate-50 text-slate-700 dark:bg-[#0b1020] dark:text-slate-300">
+    {sidebarOpen && <button className="fixed inset-0 z-40 bg-slate-950/40 lg:hidden" aria-label="Close navigation" onClick={() => setSidebarOpen(false)} />}
+    <aside className={`sidebar ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'} lg:translate-x-0`}>
+      <div className="flex h-16 items-center px-5"><div className="brand-mark"><Activity size={18}/></div><div className="ml-3"><p className="text-sm font-bold text-slate-950 dark:text-white">PayBridge</p><p className="text-[10px] font-medium text-slate-400">SIMULATION DASHBOARD</p></div></div>
+      <nav className="px-3 py-4"><p className="nav-label">Workspace</p>{navigation.map((item) => { const Icon = item.icon; return <button key={item.name} className={`nav-item ${active === item.name ? 'active' : ''}`} onClick={() => selectModule(item.name)}><Icon size={17}/><span>{item.name}</span></button> })}<p className="nav-label mt-7">Operations</p>{operations.map((item) => { const Icon = item.icon; return <button key={item.name} className={`nav-item ${active === item.name ? 'active' : ''}`} onClick={() => selectModule(item.name)}><Icon size={17}/><span>{item.name}</span></button> })}</nav>
+      <div className="mt-auto p-3"><div className="mb-3 rounded-xl border border-slate-200 p-3 dark:border-slate-800"><p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Backend status</p><p className="mt-1 text-xs">{healthResource.data?.persistence_ready ? 'SQLite ready' : healthResource.data ? 'Persistence unavailable' : healthResource.error ? 'Health unavailable' : 'Checking…'}</p></div><div className="nav-item"><div className="flex h-7 w-7 items-center justify-center rounded-full bg-indigo-100 text-xs font-bold text-indigo-700">PB</div><span>Local operator</span></div></div>
+    </aside>
+    <main className="lg:ml-[232px]">
+      <header className="topbar"><button className="icon-button lg:hidden" onClick={() => setSidebarOpen(true)} aria-label="Open navigation"><ChevronRight size={18}/></button><div className="hidden items-center gap-2 text-xs text-slate-400 sm:flex"><span>PayBridge</span><span>/</span><strong className="font-medium text-slate-700 dark:text-slate-200">{active}</strong></div><div className="ml-auto flex items-center gap-3"><span className="demo-badge">SIMULATION</span><span className="hidden text-[11px] text-slate-400 md:inline">Last refresh: {formatRefresh(mostRecentRefresh)}</span><button className="icon-button" onClick={() => setDark((value) => !value)} aria-label="Toggle theme">{dark ? <Sun size={16}/> : <Moon size={16}/>}</button><button className="avatar" aria-label="PayBridge local operator">PB</button></div></header>
+      <div className="mx-auto max-w-[1440px] p-4 md:p-6">{renderModule()}</div>
+    </main>
+    {selectedTransactionId && <TransactionDetailPanel key={selectedTransactionId} transactionId={selectedTransactionId} onClose={() => setSelectedTransactionId(null)}/>}
+  </div>
 }
 
 export default App

@@ -1,0 +1,296 @@
+warning: in the working copy of 'src/terminal/TerminalManager.cpp', LF will be replaced by CRLF the next time Git touches it
+[1mdiff --git a/src/terminal/TerminalManager.cpp b/src/terminal/TerminalManager.cpp[m
+[1mindex 73858e1..a6c1bc3 100644[m
+[1m--- a/src/terminal/TerminalManager.cpp[m
+[1m+++ b/src/terminal/TerminalManager.cpp[m
+[36m@@ -1,26 +1,75 @@[m
+ #include "TerminalManager.h"[m
+ [m
+[32m+[m[32m#include <algorithm>[m
+[32m+[m[32m#include <exception>[m
+[32m+[m
+ namespace paybridge::terminal[m
+ {[m
+[32m+[m[32mnamespace[m
+[32m+[m[32m{[m
+[32m+[m[32mbool adapterSupports(const std::shared_ptr<ITerminalAdapter>& adapter,[m
+[32m+[m[32m    const TerminalModel& terminal) noexcept[m
+[32m+[m[32m{[m
+[32m+[m[32m    try { return adapter && adapter->supports(terminal); }[m
+[32m+[m[32m    catch (...) { return false; }[m
+[32m+[m[32m}[m
+[32m+[m[32m}[m
+ [m
+[31m-void TerminalManager::registerTerminal(const TerminalModel& terminal)[m
+[32m+[m[32mbool TerminalManager::registerTerminal(const TerminalModel& terminal)[m
+ {[m
+     if (terminal.terminalId.empty())[m
+[31m-        return;[m
+[31m-[m
+[32m+[m[32m        return false;[m
+[32m+[m[32m    std::shared_ptr<std::mutex> operationLock;[m
+[32m+[m[32m    {[m
+[32m+[m[32m        std::lock_guard<std::mutex> lock(mutex);[m
+[32m+[m[32m        auto& storedLock = operationLocks[terminal.terminalId];[m
+[32m+[m[32m        if (!storedLock) storedLock = std::make_shared<std::mutex>();[m
+[32m+[m[32m        operationLock = storedLock;[m
+[32m+[m[32m    }[m
+[32m+[m[32m    std::lock_guard<std::mutex> operation(*operationLock);[m
+     std::lock_guard<std::mutex> lock(mutex);[m
+[32m+[m[32m    if (!terminal.adapterId.empty())[m
+[32m+[m[32m    {[m
+[32m+[m[32m        const auto adapter = adapters.find(terminal.adapterId);[m
+[32m+[m[32m        if (adapter == adapters.end() || !adapterSupports(adapter->second, terminal))[m
+[32m+[m[32m            return false;[m
+[32m+[m[32m    }[m
+     terminalModels[terminal.terminalId] = terminal;[m
+[32m+[m[32m    return true;[m
+ }[m
+ [m
+[31m-bool TerminalManager::removeTerminal(const std::string& terminalId)[m
+[32m+[m[32mstd::shared_ptr<std::mutex> TerminalManager::operationLockFor(const std::string& terminalId) const[m
+ {[m
+     std::lock_guard<std::mutex> lock(mutex);[m
+[32m+[m[32m    const auto found = operationLocks.find(terminalId);[m
+[32m+[m[32m    return found == operationLocks.end() ? nullptr : found->second;[m
+[32m+[m[32m}[m
+ [m
+[31m-    const auto transport = transports.find(terminalId);[m
+[31m-    if (transport != transports.end())[m
+[31m-        transport->second->close();[m
+[31m-[m
+[31m-    transports.erase(terminalId);[m
+[32m+[m[32mbool TerminalManager::removeTerminal(const std::string& terminalId)[m
+[32m+[m[32m{[m
+[32m+[m[32m    const auto operationLock = operationLockFor(terminalId);[m
+[32m+[m[32m    if (operationLock)[m
+[32m+[m[32m    {[m
+[32m+[m[32m        std::lock_guard<std::mutex> operation(*operationLock);[m
+[32m+[m[32m        std::unique_ptr<transport::ITransport> removedTransport;[m
+[32m+[m[32m        bool removed = false;[m
+[32m+[m[32m        {[m
+[32m+[m[32m            std::lock_guard<std::mutex> lock(mutex);[m
+[32m+[m[32m            const auto transport = transports.find(terminalId);[m
+[32m+[m[32m            if (transport != transports.end())[m
+[32m+[m[32m            {[m
+[32m+[m[32m                removedTransport = std::move(transport->second);[m
+[32m+[m[32m                transports.erase(transport);[m
+[32m+[m[32m            }[m
+[32m+[m[32m            removed = terminalModels.erase(terminalId) != 0;[m
+[32m+[m[32m        }[m
+[32m+[m[32m        if (removedTransport) removedTransport->close();[m
+[32m+[m[32m        // Keep this mutex for the lifetime of the manager. A thread may[m
+[32m+[m[32m        // already be waiting on its shared_ptr; erasing it could let a[m
+[32m+[m[32m        // re-registered terminal acquire a second lock and overlap that call.[m
+[32m+[m[32m        return removed;[m
+[32m+[m[32m    }[m
+[32m+[m[32m    std::lock_guard<std::mutex> lock(mutex);[m
+     return terminalModels.erase(terminalId) != 0;[m
+ }[m
+ [m
+[36m@@ -43,54 +92,316 @@[m [mstd::vector<TerminalModel> TerminalManager::terminals() const[m
+     return result;[m
+ }[m
+ [m
+[31m-void TerminalManager::setTransport([m
+[31m-    const std::string& terminalId,[m
+[31m-    std::unique_ptr<transport::ITransport> transport)[m
+[32m+[m[32mstd::vector<TerminalReadModel> TerminalManager::terminalSnapshots() const[m
+ {[m
+[31m-    if (terminalId.empty() || !transport)[m
+[31m-        return;[m
+[32m+[m[32m    std::lock_guard<std::mutex> lock(mutex);[m
+[32m+[m[32m    std::vector<TerminalReadModel> result;[m
+[32m+[m[32m    result.reserve(terminalModels.size());[m
+[32m+[m[32m    for (const auto& [id, model] : terminalModels)[m
+[32m+[m[32m    {[m
+[32m+[m[32m        const bool configured = transports.find(id) != transports.end();[m
+[32m+[m[32m        const bool simulated = model.transportKind == TransportKind::SIMULATED;[m
+[32m+[m[32m        const bool connectionReady =[m
+[32m+[m[32m            model.connectionStatus == TerminalConnectionStatus::DISCONNECTED ||[m
+[32m+[m[32m            model.connectionStatus == TerminalConnectionStatus::CONNECTED;[m
+[32m+[m[32m        result.push_back({id, simulated, configured,[m
+[32m+[m[32m            terminalConnectionStatusToString(model.connectionStatus),[m
+[32m+[m[32m            configured && simulated && connectionReady});[m
+[32m+[m[32m    }[m
+[32m+[m[32m    std::sort(result.begin(), result.end(), [](const auto& left, const auto& right)[m
+[32m+[m[32m    {[m
+[32m+[m[32m        return left.terminalId < right.terminalId;[m
+[32m+[m[32m    });[m
+[32m+[m[32m    return result;[m
+[32m+[m[32m}[m
+ [m
+[32m+[m[32mbool TerminalManager::selectSimulatedTerminal([m
+[32m+[m[32m    const std::string& requestedTerminalId,[m
+[32m+[m[32m    std::string& selectedTerminalId,[m
+[32m+[m[32m    std::string& error) const[m
+[32m+[m[32m{[m
+     std::lock_guard<std::mutex> lock(mutex);[m
+[32m+[m[32m    selectedTerminalId.clear();[m
+[32m+[m[32m    error.clear();[m
+[32m+[m[32m    if (!requestedTerminalId.empty())[m
+[32m+[m[32m    {[m
+[32m+[m[32m        const auto model = terminalModels.find(requestedTerminalId);[m
+[32m+[m[32m        if (model == terminalModels.end() || model->second.transportKind != TransportKind::SIMULATED ||[m
+[32m+[m[32m            transports.find(requestedTerminalId) == transports.end())[m
+[32m+[m[32m        { error = "Requested simulated terminal is not configured"; return false; }[m
+[32m+[m[32m        selectedTerminalId = requestedTerminalId;[m
+[32m+[m[32m        return true;[m
+[32m+[m[32m    }[m
+ [m
+[31m-    if (terminalModels.find(terminalId) == terminalModels.end())[m
+[31m-        return;[m
+[32m+[m[32m    for (const auto& [id, model] : terminalModels)[m
+[32m+[m[32m    {[m
+[32m+[m[32m        if (model.transportKind != TransportKind::SIMULATED || transports.find(id) == transports.end())[m
+[32m+[m[32m            continue;[m
+[32m+[m[32m        if (!selectedTerminalId.empty())[m
+[32m+[m[32m        { selectedTerminalId.clear(); error = "Terminal selection is ambiguous"; return false; }[m
+[32m+[m[32m        selectedTerminalId = id;[m
+[32m+[m[32m    }[m
+[32m+[m[32m    if (selectedTerminalId.empty())[m
+[32m+[m[32m    { error = "No configured simulated terminal is available"; return false; }[m
+[32m+[m[32m    return true;[m
+[32m+[m[32m}[m
+ [m
+[31m-    transports[terminalId] = std::move(transport);[m
+[32m+[m[32mbool TerminalManager::registerAdapter(std::shared_ptr<ITerminalAdapter> adapter)[m
+[32m+[m[32m{[m
+[32m+[m[32m    if (!adapter) return false;[m
+[32m+[m[32m    std::string id;[m
+[32m+[m[32m    try { id = adapter->adapterId(); }[m
+[32m+[m[32m    catch (...) { return false; }[m
+[32m+[m[32m    if (id.empty() || id.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")[m
+[32m+[m[32m        != std::string::npos) return false;[m
+[32m+[m[32m    std::lock_guard<std::mutex> lock(mutex);[m
+[32m+[m[32m    if (adapters.find(id) != adapters.end()) return false;[m
+[32m+[m[32m    adapters.emplace(id, std::move(adapter));[m
+[32m+[m[32m    return true;[m
+ }[m
+ [m
+[31m-transport::TransportResult TerminalManager::connect(const std::string& terminalId)[m
+[32m+[m[32mbool TerminalManager::selectTerminal(const std::string& requestedTerminalId,[m
+[32m+[m[32m    std::string& selectedTerminalId, std::string& error) const[m
+ {[m
+     std::lock_guard<std::mutex> lock(mutex);[m
+[32m+[m[32m    selectedTerminalId.clear();[m
+[32m+[m[32m    error.clear();[m
+[32m+[m[32m    auto compatible = [this](const TerminalModel& model)[m
+[32m+[m[32m    {[m
+[32m+[m[32m        if (transports.find(model.terminalId) == transports.end()) return false;[m
+[32m+[m[32m        if (!model.adapterId.empty())[m
+[32m+[m[32m        {[m
+[32m+[m[32m            const auto adapter = adapters.find(model.adapterId);[m
+[32m+[m[32m            return adapter != adapters.end() && adapterSupports(adapter->second, model);[m
+[32m+[m[32m        }[m
+[32m+[m[32m        std::size_t matches = 0;[m
+[32m+[m[32m        for (const auto& [id, adapter] : adapters)[m
+[32m+[m[32m            if (adapterSupports(adapter, model)) ++matches;[m
+[32m+[m[32m        return matches == 1;[m
+[32m+[m[32m    };[m
+[32m+[m[32m    if (!requestedTerminalId.empty())[m
+[32m+[m[32m    {[m
+[32m+[m[32m        const auto terminal = terminalModels.find(requestedTerminalId);[m
+[32m+[m[32m        if (terminal == terminalModels.end() || !compatible(terminal->second))[m
+[32m+[m[32m        { error = "Requested terminal is not configured with a compatible adapter"; return false; }[m
+[32m+[m[32m        selectedTerminalId = requestedTerminalId;[m
+[32m+[m[32m        return true;[m
+[32m+[m[32m    }[m
+[32m+[m[32m    std::vector<std::string> candidates;[m
+[32m+[m[32m    for (const auto& [id, model] : terminalModels)[m
+[32m+[m[32m        if (compatible(model)) candidates.push_back(id);[m
+[32m+[m[32m    std::sort(candidates.begin(), candidates.end());[m
+[32m+[m[32m    if (candidates.empty()) { error = "No configured compatible terminal is available"; return false; }[m
+[32m+[m[32m    if (candidates.size() != 1) { error = "Terminal selection is ambiguous"; return false; }[m
+[32m+[m[32m    selectedTerminalId = candidates.front();[m
+[32m+[m[32m    return true;[m
+[32m+[m[32m}[m
+ [m
+[31m-    const auto model = terminalModels.find(terminalId);[m
+[31m-    if (model == terminalModels.end())[m
+[31m-        return {false, transport::TransportError::INVALID_ARGUMENT, "Unknown terminal identifier"};[m
+[32m+[m[32mTerminalOperationResult TerminalManager::executeOperation([m
+[32m+[m[32m    const TerminalOperationRequest& request,[m
+[32m+[m[32m    const ITerminalAdapter::BeforeSend& beforeSend)[m
+[32m+[m[32m{[m
+[32m+[m[32m    auto failure = [&request](TerminalOperationOutcome outcome, const char* code,[m
+[32m+[m[32m        const char* message, bool mayHaveSent = false)[m
+[32m+[m[32m    {[m
+[32m+[m[32m        return TerminalOperationResult{outcome, request.requestId, request.transactionId,[m
+[32m+[m[32m            request.externalReference, request.terminalId, code, message, false, mayHaveSent};[m
+[32m+[m[32m    };[m
+[32m+[m[32m    if (!request.isValid())[m
+[32m+[m[32m        return failure(TerminalOperationOutcome::FAILED, "INVALID_OPERATION", "Operation request is invalid");[m
+[32m+[m[32m    const auto operationLock = operationLockFor(request.terminalId);[m
+[32m+[m[32m    if (!operationLock)[m
+[32m+[m[32m        return failure(TerminalOperationOutcome::FAILED, "TERMINAL_UNAVAILABLE", "Terminal is not configured");[m
+[32m+[m[32m    std::lock_guard<std::mutex> operation(*operationLock);[m
+[32m+[m
+[32m+[m[32m    transport::ITransport* byteTransport = nullptr;[m
+[32m+[m[32m    std::shared_ptr<ITerminalAdapter> adapter;[m
+[32m+[m[32m    {[m
+[32m+[m[32m        std::lock_guard<std::mutex> lock(mutex);[m
+[32m+[m[32m        const auto model = terminalModels.find(request.terminalId);[m
+[32m+[m[32m        const auto transport = transports.find(request.terminalId);[m
+[32m+[m[32m        if (model == terminalModels.end() || transport == transports.end())[m
+[32m+[m[32m            return failure(TerminalOperationOutcome::FAILED, "TERMINAL_UNAVAILABLE", "Terminal is not configured");[m
+[32m+[m[32m        byteTransport = transport->second.get();[m
+[32m+[m[32m        if (!model->second.adapterId.empty())[m
+[32m+[m[32m        {[m
+[32m+[m[32m            const auto found = adapters.find(model->second.adapterId);[m
+[32m+[m[32m            if (found != adapters.end() && adapterSupports(found->second, model->second)) adapter = found->second;[m
+[32m+[m[32m        }[m
+[32m+[m[32m        else[m
+[32m+[m[32m        {[m
+[32m+[m[32m            for (const auto& [id, candidate] : adapters)[m
+[32m+[m[32m                if (adapterSupports(candidate, model->second))[m
+[32m+[m[32m                {[m
+[32m+[m[32m                    if (adapter) return failure(TerminalOperationOutcome::FAILED,[m
+[32m+[m[32m                        "ADAPTER_AMBIGUOUS", "Multiple terminal adapters match");[m
+[32m+[m[32m                    adapter = candidate;[m
+[32m+[m[32m                }[m
+[32m+[m[32m        }[m
+[32m+[m[32m        if (!adapter)[m
+[32m+[m[32m            return failure(TerminalOperationOutcome::FAILED, "ADAPTER_UNAVAILABLE", "No compatible adapter is registered");[m
+[32m+[m[32m    }[m
+ [m
+[31m-    const auto transport = transports.find(terminalId);[m
+[31m-    if (transport == transports.end())[m
+[31m-        return {false, transport::TransportError::NOT_OPEN, "Terminal transport is not configured"};[m
+[32m+[m[32m    if (!byteTransport->isOpen())[m
+[32m+[m[32m    {[m
+[32m+[m[32m        {[m
+[32m+[m[32m            std::lock_guard<std::mutex> lock(mutex);[m
+[32m+[m[32m            const auto model = terminalModels.find(request.terminalId);[m
+[32m+[m[32m            if (model != terminalModels.end()) model->second.connectionStatus = TerminalConnectionStatus::CONNECTING;[m
+[32m+[m[32m        }[m
+[32m+[m[32m        transport::TransportResult opened;[m
+[32m+[m[32m        try[m
+[32m+[m[32m        {[m
+[32m+[m[32m            opened = byteTransport->open();[m
+[32m+[m[32m        }[m
+[32m+[m[32m        catch (...)[m
+[32m+[m[32m        {[m
+[32m+[m[32m            std::lock_guard<std::mutex> lock(mutex);[m
+[32m+[m[32m            const auto model = terminalModels.find(request.terminalId);[m
+[32m+[m[32m            if (model != terminalModels.end())[m
+[32m+[m[32m                model->second.connectionStatus = TerminalConnectionStatus::FAILED;[m
+[32m+[m
+[32m+[m[32m            return failure(TerminalOperationOutcome::FAILED,[m
+[32m+[m[32m                "TERMINAL_CONNECT_FAILED", "Terminal connection failed");[m
+[32m+[m[32m        }[m
+[32m+[m[32m        {[m
+[32m+[m[32m            std::lock_guard<std::mutex> lock(mutex);[m
+[32m+[m[32m            const auto model = terminalModels.find(request.terminalId);[m
+[32m+[m[32m            if (model != terminalModels.end()) model->second.connectionStatus = opened.success[m
+[32m+[m[32m                ? TerminalConnectionStatus::CONNECTED : TerminalConnectionStatus::FAILED;[m
+[32m+[m[32m        }[m
+[32m+[m[32m        if (!opened.success)[m
+[32m+[m[32m            return failure(TerminalOperationOutcome::FAILED, "TERMINAL_CONNECT_FAILED", "Terminal connection failed");[m
+[32m+[m[32m    }[m
+[32m+[m[32m    bool beforeSendAttempted = false;[m
+[32m+[m[32m    bool beforeSendPassed = false;[m
+[32m+[m[32m    const ITerminalAdapter::BeforeSend guardedBeforeSend = [&]()[m
+[32m+[m[32m    {[m
+[32m+[m[32m        if (beforeSendAttempted) return false;[m
+[32m+[m[32m        beforeSendAttempted = 
