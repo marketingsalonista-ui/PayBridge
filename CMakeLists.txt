@@ -57,6 +57,7 @@ add_executable(PayBridge
     src/terminal/SimulatedTerminalProtocol.cpp
     src/terminal/SimulatedTerminalPeer.cpp
     src/terminal/SimulatedTerminalAdapter.cpp
+    src/terminal/Vx680UnverifiedAdapter.cpp
 )
 
 target_link_libraries(PayBridge
@@ -153,6 +154,7 @@ add_executable(TransactionEngineTests
     src/terminal/SimulatedTerminalProtocol.cpp
     src/terminal/SimulatedTerminalPeer.cpp
     src/terminal/SimulatedTerminalAdapter.cpp
+    src/terminal/Vx680UnverifiedAdapter.cpp
 )
 
 target_link_libraries(TransactionEngineTests
@@ -250,6 +252,7 @@ add_executable(TcpServerLifecycleTests
     src/terminal/SimulatedTerminalProtocol.cpp
     src/terminal/SimulatedTerminalPeer.cpp
     src/terminal/SimulatedTerminalAdapter.cpp
+    src/terminal/Vx680UnverifiedAdapter.cpp
 )
 
 target_link_libraries(TcpServerLifecycleTests
@@ -265,3 +268,20 @@ target_link_libraries(TcpServerLifecycleTests
 )
 
 add_test(NAME TcpServerLifecycleTests COMMAND TcpServerLifecycleTests)
+
+add_executable(Vx680UnverifiedAdapterTests
+    tests/Vx680UnverifiedAdapterTests.cpp
+    src/terminal/Vx680UnverifiedAdapter.cpp
+    src/terminal/TerminalModel.cpp
+    src/assets/Asset.cpp
+    src/money/Money.cpp
+    src/money/AmountParser.cpp
+    src/transports/TransportResult.cpp
+)
+
+target_link_libraries(Vx680UnverifiedAdapterTests
+    PRIVATE
+        Threads::Threads
+)
+
+add_test(NAME Vx680UnverifiedAdapterTests COMMAND Vx680UnverifiedAdapterTests)
