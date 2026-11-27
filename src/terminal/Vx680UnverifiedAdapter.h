@@ -16,6 +16,9 @@ public:
 
     std::string adapterId() const override;
     bool supports(const TerminalModel& terminal) const override;
+    AdapterPreflightResult preflight(
+        const TerminalModel& terminal,
+        const transport::ITransport& transport) const override;
     TerminalOperationResult execute(const TerminalOperationRequest& request,
         transport::ITransport& transport, const BeforeSend& beforeSend) const override;
 };

@@ -18,6 +18,7 @@ public:
     transport::TransportResult open() override;
     void close() noexcept override;
     bool isOpen() const noexcept override;
+    bool isSimulationTransport() const noexcept override { return true; }
 
     transport::TransportResult send(const std::vector<std::uint8_t>& bytes) override;
     transport::TransportBytes receive(std::size_t maximumBytes) override;

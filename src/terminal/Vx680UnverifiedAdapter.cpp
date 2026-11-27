@@ -17,6 +17,17 @@ bool Vx680UnverifiedAdapter::supports(const TerminalModel& terminal) const
         terminal.transportKind != TransportKind::SIMULATED;
 }
 
+AdapterPreflightResult Vx680UnverifiedAdapter::preflight(
+    const TerminalModel&,
+    const transport::ITransport&) const
+{
+    return {
+        false,
+        "VX680_PROTOCOL_NOT_VERIFIED",
+        "VX 680 protocol is not verified; no connection or request was attempted"
+    };
+}
+
 TerminalOperationResult Vx680UnverifiedAdapter::execute(
     const TerminalOperationRequest& request,
     transport::ITransport& /*transport*/,

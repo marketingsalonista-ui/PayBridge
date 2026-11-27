@@ -1,4 +1,4 @@
-﻿cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.20)
 
 project(PayBridge VERSION 0.6.0 LANGUAGES CXX)
 
@@ -57,6 +57,7 @@ add_executable(PayBridge
     src/terminal/SimulatedTerminalProtocol.cpp
     src/terminal/SimulatedTerminalPeer.cpp
     src/terminal/SimulatedTerminalAdapter.cpp
+    src/terminal/VerifoneVx680SimulatorAdapter.cpp
     src/terminal/Vx680UnverifiedAdapter.cpp
 )
 
@@ -184,6 +185,8 @@ add_executable(TerminalAdapterTests
     src/terminal/SimulatedTerminalProtocol.cpp
     src/terminal/SimulatedTerminalPeer.cpp
     src/terminal/SimulatedTerminalAdapter.cpp
+    src/terminal/VerifoneVx680SimulatorAdapter.cpp
+    src/terminal/Vx680UnverifiedAdapter.cpp
 )
 
 target_link_libraries(TerminalAdapterTests
@@ -285,3 +288,30 @@ target_link_libraries(Vx680UnverifiedAdapterTests
 )
 
 add_test(NAME Vx680UnverifiedAdapterTests COMMAND Vx680UnverifiedAdapterTests)
+
+# --------------------------------------------------
+# Standalone Verifone VX 680 Simulator Demo
+# --------------------------------------------------
+
+add_executable(VerifoneVx680Demo
+    src/simulator/VerifoneVx680Demo.cpp
+
+    src/assets/Asset.cpp
+
+    src/money/Money.cpp
+    src/money/AmountParser.cpp
+
+    src/transports/TransportResult.cpp
+
+    src/terminal/TerminalModel.cpp
+    src/terminal/SimulatedTerminalTransport.cpp
+    src/terminal/SimulatedTerminalProtocol.cpp
+    src/terminal/SimulatedTerminalPeer.cpp
+    src/terminal/SimulatedTerminalAdapter.cpp
+    src/terminal/VerifoneVx680SimulatorAdapter.cpp
+)
+
+target_link_libraries(VerifoneVx680Demo
+    PRIVATE
+        Threads::Threads
+)

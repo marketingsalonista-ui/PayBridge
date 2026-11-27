@@ -1,8 +1,11 @@
 #include "../src/terminal/ITerminalAdapter.h"
 #include "../src/terminal/SimulatedTerminalAdapter.h"
+#include "../src/terminal/VerifoneVx680SimulatorAdapter.h"
 #include "../src/terminal/SimulatedTerminalTransport.h"
 #include "../src/terminal/SimulatedTerminalProtocol.h"
 #include "../src/terminal/TerminalManager.h"
+#include "../src/terminal/Vx680UnverifiedAdapter.h"
+#include "../src/transports/ITransport.h"
 
 #include <cassert>
 #include <atomic>
@@ -18,6 +21,54 @@ using namespace paybridge::terminal;
 
 namespace
 {
+class PreflightCountingTransport final : public paybridge::transport::ITransport
+{
+public:
+    paybridge::transport::TransportResult open() override
+    {
+        ++openCalls;
+        return {true};
+    }
+
+    void close() noexcept override {}
+
+    bool isOpen() const noexcept override
+    {
+        ++isOpenCalls;
+        return false;
+    }
+
+    paybridge::transport::TransportResult send(
+        const std::vector<std::uint8_t>&) override
+    {
+        ++sendCalls;
+        return {true};
+    }
+
+    paybridge::transport::TransportBytes receive(std::size_t) override
+    {
+        ++receiveCalls;
+        return {{
+            false,
+            paybridge::transport::TransportError::DISCONNECTED,
+            "unused"
+        }, {}};
+    }
+
+    void setReceiveTimeoutMilliseconds(std::uint32_t) noexcept override {}
+    void setSendTimeoutMilliseconds(std::uint32_t) noexcept override {}
+
+    std::string description() const override
+    {
+        return "preflight counting transport";
+    }
+
+    int openCalls = 0;
+    mutable int isOpenCalls = 0;
+    int sendCalls = 0;
+    int receiveCalls = 0;
+};
+
 TerminalOperationRequest validRequest()
 {
     TerminalOperationRequest request;
@@ -79,6 +130,64 @@ public:
     }
 };
 
+class PreflightThrowingTestAdapter final : public ITerminalAdapter
+{
+public:
+    std::string adapterId() const override
+    {
+        return "test.preflight-throwing.v1";
+    }
+
+    bool supports(const TerminalModel& terminal) const override
+    {
+        return terminal.transportKind == TransportKind::SIMULATED;
+    }
+
+    AdapterPreflightResult preflight(
+        const TerminalModel&,
+        const paybridge::transport::ITransport&) const override
+    {
+        throw std::runtime_error("Injected preflight exception");
+    }
+
+    TerminalOperationResult execute(
+        const TerminalOperationRequest&,
+        paybridge::transport::ITransport&,
+        const BeforeSend&) const override
+    {
+        assert(false && "execute must not run after preflight throws");
+        return {};
+    }
+};
+class PreflightNotReadyTestAdapter final : public ITerminalAdapter
+{
+public:
+    std::string adapterId() const override
+    {
+        return "test.preflight-not-ready.v1";
+    }
+
+    bool supports(const TerminalModel& terminal) const override
+    {
+        return terminal.transportKind == TransportKind::SIMULATED;
+    }
+
+    AdapterPreflightResult preflight(
+        const TerminalModel&,
+        const paybridge::transport::ITransport&) const override
+    {
+        return {false, "", ""};
+    }
+
+    TerminalOperationResult execute(
+        const TerminalOperationRequest&,
+        paybridge::transport::ITransport&,
+        const BeforeSend&) const override
+    {
+        assert(false && "execute must not run when preflight is not ready");
+        return {};
+    }
+};
 class SlowTestAdapter final : public ITerminalAdapter
 {
 public:
@@ -593,7 +702,134 @@ int main()
     assert(adapter.supports(model));
     model.transportKind = TransportKind::SERIAL;
     assert(!adapter.supports(model));
+    // Verifone VX 680 simulator profile: explicitly simulated only.
+    VerifoneVx680SimulatorAdapter verifoneSimulator;
+    TerminalModel verifoneModel;
+    verifoneModel.terminalId = request.terminalId;
+    verifoneModel.manufacturer = "Verifone";
+    verifoneModel.model = "VX 680";
+    verifoneModel.transportKind = TransportKind::SIMULATED;
+    verifoneModel.adapterId = VerifoneVx680SimulatorAdapter::ID;
 
+    assert(verifoneSimulator.adapterId() ==
+        VerifoneVx680SimulatorAdapter::ID);
+    assert(verifoneSimulator.supports(verifoneModel));
+    SimulatedTerminalTransport verifonePreflightTransport(
+        SimulatedTerminalOutcome::APPROVED);
+    assert(verifoneSimulator.preflight(
+        verifoneModel, verifonePreflightTransport).ready);
+
+    auto invalidVerifoneModel = verifoneModel;
+    invalidVerifoneModel.transportKind = TransportKind::TCP;
+    assert(!verifoneSimulator.supports(invalidVerifoneModel));
+    const auto tcpPreflight =
+        verifoneSimulator.preflight(
+            invalidVerifoneModel, verifonePreflightTransport);
+    assert(!tcpPreflight.ready);
+    assert(tcpPreflight.resultCode == "VERIFONE_SIMULATOR_PROFILE_INVALID");
+
+    invalidVerifoneModel = verifoneModel;
+    invalidVerifoneModel.transportKind = TransportKind::SERIAL;
+    assert(!verifoneSimulator.supports(invalidVerifoneModel));
+
+    invalidVerifoneModel = verifoneModel;
+    invalidVerifoneModel.manufacturer = "Other";
+    assert(!verifoneSimulator.supports(invalidVerifoneModel));
+
+    invalidVerifoneModel = verifoneModel;
+    invalidVerifoneModel.model = "Other";
+    assert(!verifoneSimulator.supports(invalidVerifoneModel));
+
+    invalidVerifoneModel = verifoneModel;
+    invalidVerifoneModel.adapterId.clear();
+    assert(!verifoneSimulator.supports(invalidVerifoneModel));
+
+    {
+        PreflightCountingTransport nonSimulatedTransport;
+        const auto transportPreflight = verifoneSimulator.preflight(
+            verifoneModel, nonSimulatedTransport);
+
+        assert(!transportPreflight.ready);
+        assert(transportPreflight.resultCode ==
+            "VERIFONE_SIMULATOR_TRANSPORT_REQUIRED");
+        assert(nonSimulatedTransport.isOpenCalls == 0);
+        assert(nonSimulatedTransport.openCalls == 0);
+        assert(nonSimulatedTransport.sendCalls == 0);
+        assert(nonSimulatedTransport.receiveCalls == 0);
+    }
+
+    // Approval and decline are generated by the simulator, not hardware.
+    {
+        SimulatedTerminalTransport verifoneApprovedTransport(
+            SimulatedTerminalOutcome::APPROVED);
+        assert(verifoneApprovedTransport.open().success);
+
+        bool persistedBeforeSend = false;
+        const auto verifoneApproved = verifoneSimulator.execute(
+            request,
+            verifoneApprovedTransport,
+            [&]
+            {
+                persistedBeforeSend = true;
+                return true;
+            });
+
+        assert(persistedBeforeSend);
+        assert(verifoneApproved.outcome == TerminalOperationOutcome::APPROVED);
+        assert(verifoneApproved.simulated);
+        assert(verifoneApproved.correlatesTo(request));
+    }
+
+    {
+        SimulatedTerminalTransport verifoneDeclinedTransport(
+            SimulatedTerminalOutcome::DECLINED);
+        assert(verifoneDeclinedTransport.open().success);
+
+        const auto verifoneDeclined = verifoneSimulator.execute(
+            request,
+            verifoneDeclinedTransport,
+            [] { return true; });
+
+        assert(verifoneDeclined.outcome == TerminalOperationOutcome::DECLINED);
+        assert(verifoneDeclined.simulated);
+        assert(verifoneDeclined.correlatesTo(request));
+    }
+
+    {
+        SimulatedTerminalTransport verifoneRejectedTransport(
+            SimulatedTerminalOutcome::APPROVED);
+        assert(verifoneRejectedTransport.open().success);
+
+        const auto verifoneNotPersisted = verifoneSimulator.execute(
+            request,
+            verifoneRejectedTransport,
+            [] { return false; });
+
+        assert(verifoneNotPersisted.outcome == TerminalOperationOutcome::FAILED);
+        assert(verifoneNotPersisted.simulated);
+        assert(!verifoneNotPersisted.requestMayHaveBeenSent);
+    }
+
+    // A physical/non-simulated transport must never be inspected or used.
+    {
+        PreflightCountingTransport physicalTransport;
+
+        const auto rejectedPhysicalTransport = verifoneSimulator.execute(
+            request,
+            physicalTransport,
+            [] { return true; });
+
+        assert(rejectedPhysicalTransport.outcome == TerminalOperationOutcome::FAILED);
+        assert(rejectedPhysicalTransport.resultCode ==
+            "VERIFONE_SIMULATOR_TRANSPORT_REQUIRED");
+        assert(rejectedPhysicalTransport.simulated);
+        assert(!rejectedPhysicalTransport.requestMayHaveBeenSent);
+
+        assert(physicalTransport.isOpenCalls == 0);
+        assert(physicalTransport.openCalls == 0);
+        assert(physicalTransport.sendCalls == 0);
+        assert(physicalTransport.receiveCalls == 0);
+    }
     auto runOutcome = [&](SimulatedTerminalOutcome outcome)
     {
         SimulatedTerminalTransport transport(outcome);
@@ -1221,6 +1457,197 @@ TerminalManager manager;
         std::make_unique<SimulatedTerminalTransport>(SimulatedTerminalOutcome::APPROVED));
     assert(!ambiguousManager.selectTerminal({}, selected, selectionError));
 
+    // An adapter without a preflight override remains ready by default.
+    {
+        TerminalManager defaultReadyManager;
+        auto defaultReadyAdapter = std::make_shared<RealResultTestAdapter>();
+        assert(defaultReadyManager.registerAdapter(defaultReadyAdapter));
+
+        TerminalModel terminal;
+        terminal.terminalId = "SIM-DEFAULT-PREFLIGHT";
+        terminal.adapterId = defaultReadyAdapter->adapterId();
+        terminal.transportKind = TransportKind::SIMULATED;
+        assert(defaultReadyManager.registerTerminal(terminal));
+
+        defaultReadyManager.setTransport(
+            terminal.terminalId,
+            std::make_unique<SimulatedTerminalTransport>(
+                SimulatedTerminalOutcome::APPROVED));
+
+        TerminalOperationRequest operation = validRequest();
+        operation.terminalId = terminal.terminalId;
+
+        int beforeSendCalls = 0;
+        const auto result = defaultReadyManager.executeOperation(
+            operation,
+            [&beforeSendCalls]
+            {
+                ++beforeSendCalls;
+                return true;
+            });
+
+        assert(result.outcome == TerminalOperationOutcome::APPROVED);
+        assert(result.resultCode == "REAL_APPROVED");
+        assert(beforeSendCalls == 1);
+    }
+
+    // A preflight exception must fail closed before transport interaction.
+    {
+        TerminalManager throwingPreflightManager;
+        auto throwingAdapter =
+            std::make_shared<PreflightThrowingTestAdapter>();
+        assert(throwingPreflightManager.registerAdapter(throwingAdapter));
+
+        TerminalModel terminal;
+        terminal.terminalId = "SIM-PREFLIGHT-EXCEPTION";
+        terminal.adapterId = throwingAdapter->adapterId();
+        terminal.transportKind = TransportKind::SIMULATED;
+        assert(throwingPreflightManager.registerTerminal(terminal));
+
+        auto transport = std::make_unique<PreflightCountingTransport>();
+        auto* transportProbe = transport.get();
+        throwingPreflightManager.setTransport(
+            terminal.terminalId, std::move(transport));
+
+        TerminalOperationRequest operation = validRequest();
+        operation.terminalId = terminal.terminalId;
+
+        int beforeSendCalls = 0;
+        const auto result = throwingPreflightManager.executeOperation(
+            operation,
+            [&beforeSendCalls]
+            {
+                ++beforeSendCalls;
+                return true;
+            });
+
+        assert(result.outcome == TerminalOperationOutcome::FAILED);
+        assert(result.resultCode == "ADAPTER_PREFLIGHT_FAILED");
+        assert(!result.requestMayHaveBeenSent);
+        assert(beforeSendCalls == 0);
+        assert(transportProbe->isOpenCalls == 0);
+        assert(transportProbe->openCalls == 0);
+        assert(transportProbe->sendCalls == 0);
+        assert(transportProbe->receiveCalls == 0);
+    }
+    // An adapter that is not ready with empty details receives fallback errors.
+    {
+        TerminalManager notReadyManager;
+        auto notReadyAdapter =
+            std::make_shared<PreflightNotReadyTestAdapter>();
+        assert(notReadyManager.registerAdapter(notReadyAdapter));
+
+        TerminalModel terminal;
+        terminal.terminalId = "SIM-PREFLIGHT-NOT-READY";
+        terminal.adapterId = notReadyAdapter->adapterId();
+        terminal.transportKind = TransportKind::SIMULATED;
+        assert(notReadyManager.registerTerminal(terminal));
+
+        auto transport = std::make_unique<PreflightCountingTransport>();
+        auto* transportProbe = transport.get();
+        notReadyManager.setTransport(terminal.terminalId, std::move(transport));
+
+        TerminalOperationRequest operation = validRequest();
+        operation.terminalId = terminal.terminalId;
+
+        int beforeSendCalls = 0;
+        const auto result = notReadyManager.executeOperation(
+            operation,
+            [&beforeSendCalls]
+            {
+                ++beforeSendCalls;
+                return true;
+            });
+
+        assert(result.outcome == TerminalOperationOutcome::FAILED);
+        assert(result.resultCode == "ADAPTER_NOT_READY");
+        assert(result.message == "Adapter is not ready; transport was not accessed");
+        assert(!result.requestMayHaveBeenSent);
+        assert(beforeSendCalls == 0);
+        assert(transportProbe->isOpenCalls == 0);
+        assert(transportProbe->openCalls == 0);
+        assert(transportProbe->sendCalls == 0);
+        assert(transportProbe->receiveCalls == 0);
+    }
+    // An unverified VX 680 must be rejected before any transport interaction.
+    TerminalManager vx680Manager;
+    auto vx680Adapter = std::make_shared<Vx680UnverifiedAdapter>();
+    assert(vx680Manager.registerAdapter(vx680Adapter));
+
+    TerminalModel vx680Terminal;
+    vx680Terminal.terminalId = "VX680-PREFLIGHT-TEST";
+    vx680Terminal.manufacturer = "Verifone";
+    vx680Terminal.model = "VX 680";
+    vx680Terminal.adapterId = Vx680UnverifiedAdapter::ID;
+    vx680Terminal.transportKind = TransportKind::TCP;
+    assert(vx680Manager.registerTerminal(vx680Terminal));
+
+    auto vx680Transport = std::make_unique<PreflightCountingTransport>();
+    auto* vx680TransportProbe = vx680Transport.get();
+    vx680Manager.setTransport(vx680Terminal.terminalId, std::move(vx680Transport));
+
+    TerminalOperationRequest vx680Request = validRequest();
+    vx680Request.terminalId = vx680Terminal.terminalId;
+
+    int vx680BeforeSendCalls = 0;
+    const auto vx680Result = vx680Manager.executeOperation(
+        vx680Request, [&vx680BeforeSendCalls]
+        {
+            ++vx680BeforeSendCalls;
+            return true;
+        });
+
+    assert(vx680Result.outcome == TerminalOperationOutcome::FAILED);
+    assert(vx680Result.resultCode == "VX680_PROTOCOL_NOT_VERIFIED");
+    assert(!vx680Result.requestMayHaveBeenSent);
+    assert(!vx680Result.simulated);
+    assert(vx680BeforeSendCalls == 0);
+    assert(vx680TransportProbe->isOpenCalls == 0);
+    assert(vx680TransportProbe->openCalls == 0);
+    assert(vx680TransportProbe->sendCalls == 0);
+    assert(vx680TransportProbe->receiveCalls == 0);
+
+    // The manager must reject a Verifone simulator profile paired with a
+    // non-simulated transport before inspecting or opening that transport.
+    {
+        TerminalManager verifoneManager;
+        auto verifoneAdapter =
+            std::make_shared<VerifoneVx680SimulatorAdapter>();
+        assert(verifoneManager.registerAdapter(verifoneAdapter));
+
+        TerminalModel terminal;
+        terminal.terminalId = "VERIFONE-MANAGER-PREFLIGHT";
+        terminal.manufacturer = "Verifone";
+        terminal.model = "VX 680";
+        terminal.adapterId = VerifoneVx680SimulatorAdapter::ID;
+        terminal.transportKind = TransportKind::SIMULATED;
+        assert(verifoneManager.registerTerminal(terminal));
+
+        auto transport = std::make_unique<PreflightCountingTransport>();
+        auto* transportProbe = transport.get();
+        verifoneManager.setTransport(terminal.terminalId, std::move(transport));
+
+        TerminalOperationRequest operation = validRequest();
+        operation.terminalId = terminal.terminalId;
+
+        int beforeSendCalls = 0;
+        const auto result = verifoneManager.executeOperation(
+            operation,
+            [&beforeSendCalls]
+            {
+                ++beforeSendCalls;
+                return true;
+            });
+
+        assert(result.outcome == TerminalOperationOutcome::FAILED);
+        assert(result.resultCode == "VERIFONE_SIMULATOR_TRANSPORT_REQUIRED");
+        assert(!result.requestMayHaveBeenSent);
+        assert(beforeSendCalls == 0);
+        assert(transportProbe->isOpenCalls == 0);
+        assert(transportProbe->openCalls == 0);
+        assert(transportProbe->sendCalls == 0);
+        assert(transportProbe->receiveCalls == 0);
+    }
     // Lifecycle changes are coordinated with a deterministic operation gate.
     TerminalManager lifecycleManager;
     TerminalModel lifecycleTerminal = serializedTerminal;

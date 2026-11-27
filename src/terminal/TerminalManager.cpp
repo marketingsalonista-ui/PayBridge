@@ -18,6 +18,10 @@ public:
     transport::TransportResult open() override { return underlying.open(); }
     void close() noexcept override { underlying.close(); }
     bool isOpen() const noexcept override { return underlying.isOpen(); }
+    bool isSimulationTransport() const noexcept override
+    {
+        return underlying.isSimulationTransport();
+    }
 
     transport::TransportResult send(
         const std::vector<std::uint8_t>& bytes) override
@@ -249,8 +253,8 @@ TerminalOperationResult TerminalManager::executeOperation(
     const TerminalOperationRequest& request,
     const ITerminalAdapter::BeforeSend& beforeSend)
 {
-    auto failure = [&request](TerminalOperationOutcome outcome, const char* code,
-        const char* message, bool mayHaveSent = false)
+    auto failure = [&request](TerminalOperationOutcome outcome, const std::string& code,
+        const std::string& message, bool mayHaveSent = false)
     {
         return TerminalOperationResult{outcome, request.requestId, request.transactionId,
             request.externalReference, request.terminalId, code, message, false, mayHaveSent};
@@ -264,12 +268,14 @@ TerminalOperationResult TerminalManager::executeOperation(
 
     transport::ITransport* byteTransport = nullptr;
     std::shared_ptr<ITerminalAdapter> adapter;
+    TerminalModel selectedModel;
     {
         std::lock_guard<std::mutex> lock(mutex);
         const auto model = terminalModels.find(request.terminalId);
         const auto transport = transports.find(request.terminalId);
         if (model == terminalModels.end() || transport == transports.end())
             return failure(TerminalOperationOutcome::FAILED, "TERMINAL_UNAVAILABLE", "Terminal is not configured");
+        selectedModel = model->second;
         byteTransport = transport->second.get();
         if (!model->second.adapterId.empty())
         {
@@ -288,6 +294,30 @@ TerminalOperationResult TerminalManager::executeOperation(
         }
         if (!adapter)
             return failure(TerminalOperationOutcome::FAILED, "ADAPTER_UNAVAILABLE", "No compatible adapter is registered");
+    }
+
+    // Preflight must run before even checking isOpen(). An unverified adapter
+    // must not cause any interaction with its configured transport.
+    AdapterPreflightResult readiness;
+    try
+    {
+        readiness = adapter->preflight(selectedModel, *byteTransport);
+    }
+    catch (...)
+    {
+        return failure(TerminalOperationOutcome::FAILED,
+            "ADAPTER_PREFLIGHT_FAILED",
+            "Adapter preflight failed; transport was not accessed");
+    }
+
+    if (!readiness.ready)
+    {
+        const std::string code = readiness.resultCode.empty()
+            ? "ADAPTER_NOT_READY" : readiness.resultCode;
+        const std::string message = readiness.message.empty()
+            ? "Adapter is not ready; transport was not accessed" : readiness.message;
+
+        return failure(TerminalOperationOutcome::FAILED, code, message);
     }
 
     if (!byteTransport->isOpen())

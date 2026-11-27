@@ -11,7 +11,6 @@ import {
   Search,
   Settings,
   ShieldCheck,
-  Sun,
   TerminalSquare,
   WalletCards,
   X,
@@ -242,7 +241,6 @@ function ModulePlaceholder({ title }: { title: string }) {
 
 function App() {
   const [active, setActive] = useState<ModuleName>('Overview')
-  const [dark, setDark] = useState(() => localStorage.getItem('paybridge-theme') === 'dark')
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [search, setSearch] = useState('')
   const [statusFilter, setStatusFilter] = useState<'ALL' | TransactionStatus>('ALL')
@@ -264,9 +262,9 @@ function App() {
   const healthResource = useApiResource<HealthResponse>(healthLoader, 30_000)
 
   useEffect(() => {
-    document.documentElement.classList.toggle('dark', dark)
-    localStorage.setItem('paybridge-theme', dark ? 'dark' : 'light')
-  }, [dark])
+    document.documentElement.classList.add('dark')
+    document.documentElement.style.colorScheme = 'dark'
+  }, [])
 
   const mostRecentRefresh = useMemo(() => {
     const times = [transactionsResource.lastUpdated, terminalsResource.lastUpdated,
@@ -383,7 +381,7 @@ function App() {
     }
 
     if (active === 'Settings') {
-      return <section className="panel p-6"><p className="eyebrow">Local preference</p><h1 className="mt-1 text-xl font-semibold">Settings</h1><div className="mt-6 max-w-md rounded-xl border border-slate-200 p-5 dark:border-slate-800"><p className="text-sm font-medium">Appearance</p><p className="mt-1 text-xs text-slate-500">Choose your dashboard theme.</p><div className="mt-4 flex gap-2"><button className={!dark ? 'theme-choice active' : 'theme-choice'} onClick={() => setDark(false)}><Sun size={16}/> Light</button><button className={dark ? 'theme-choice active' : 'theme-choice'} onClick={() => setDark(true)}><Moon size={16}/> Dark</button></div></div></section>
+      return <section className="panel p-6"><p className="eyebrow">Appearance</p><h1 className="mt-1 text-xl font-semibold">Settings</h1><div className="mt-6 max-w-md rounded-xl border border-slate-700/70 bg-slate-900/70 p-5"><div className="flex items-center gap-3"><div className="icon-box"><Moon size={17}/></div><div><p className="text-sm font-semibold text-slate-100">Dark mode enabled</p><p className="mt-1 text-xs text-slate-400">PayBridge uses a consistent dark interface.</p></div></div></div></section>
     }
 
     return <ModulePlaceholder title={active}/>
@@ -396,8 +394,8 @@ function App() {
       <nav className="px-3 py-4"><p className="nav-label">Workspace</p>{navigation.map((item) => { const Icon = item.icon; return <button key={item.name} className={`nav-item ${active === item.name ? 'active' : ''}`} onClick={() => selectModule(item.name)}><Icon size={17}/><span>{item.name}</span></button> })}<p className="nav-label mt-7">Operations</p>{operations.map((item) => { const Icon = item.icon; return <button key={item.name} className={`nav-item ${active === item.name ? 'active' : ''}`} onClick={() => selectModule(item.name)}><Icon size={17}/><span>{item.name}</span></button> })}</nav>
       <div className="mt-auto p-3"><div className="mb-3 rounded-xl border border-slate-200 p-3 dark:border-slate-800"><p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Backend status</p><p className="mt-1 text-xs">{healthResource.data?.persistence_ready ? 'SQLite ready' : healthResource.data ? 'Persistence unavailable' : healthResource.error ? 'Health unavailable' : 'Checking…'}</p></div><div className="nav-item"><div className="flex h-7 w-7 items-center justify-center rounded-full bg-indigo-100 text-xs font-bold text-indigo-700">PB</div><span>Local operator</span></div></div>
     </aside>
-    <main className="lg:ml-[232px]">
-      <header className="topbar"><button className="icon-button lg:hidden" onClick={() => setSidebarOpen(true)} aria-label="Open navigation"><ChevronRight size={18}/></button><div className="hidden items-center gap-2 text-xs text-slate-400 sm:flex"><span>PayBridge</span><span>/</span><strong className="font-medium text-slate-700 dark:text-slate-200">{active}</strong></div><div className="ml-auto flex items-center gap-3"><span className="demo-badge">SIMULATION</span><span className="hidden text-[11px] text-slate-400 md:inline">Last refresh: {formatRefresh(mostRecentRefresh)}</span><button className="icon-button" onClick={() => setDark((value) => !value)} aria-label="Toggle theme">{dark ? <Sun size={16}/> : <Moon size={16}/>}</button><button className="avatar" aria-label="PayBridge local operator">PB</button></div></header>
+    <main className="lg:ml-[248px]">
+      <header className="topbar"><button className="icon-button lg:hidden" onClick={() => setSidebarOpen(true)} aria-label="Open navigation"><ChevronRight size={18}/></button><div className="hidden items-center gap-2 text-xs text-slate-400 sm:flex"><span>PayBridge</span><span>/</span><strong className="font-medium text-slate-700 dark:text-slate-200">{active}</strong></div><div className="ml-auto flex items-center gap-3"><span className="demo-badge">SIMULATION</span><span className="hidden text-[11px] text-slate-400 md:inline">Last refresh: {formatRefresh(mostRecentRefresh)}</span><button className="avatar" aria-label="PayBridge local operator">PB</button></div></header>
       <div className="mx-auto max-w-[1440px] p-4 md:p-6">{renderModule()}</div>
     </main>
     {selectedTransactionId && <TransactionDetailPanel key={selectedTransactionId} transactionId={selectedTransactionId} onClose={() => setSelectedTransactionId(null)}/>}

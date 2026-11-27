@@ -1,0 +1,14 @@
+/* Global reset and base typography. Dashboard-specific styling lives in dashboard.css. */
+:root {
+  color-scheme: dark;
+  font-family: Inter, "Segoe UI", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+html, body, #root { min-width: 320px; min-height: 100%; margin: 0; }
+body { min-height: 100vh; }
+*, *::before, *::after { box-sizing: border-box; }
+p { margin: 0; }
+button, input, select { font: inherit; }

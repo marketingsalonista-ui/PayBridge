@@ -2,6 +2,7 @@
 #include "../protocol/JsonHandler.h"
 #include "../terminal/SimulatedTerminalTransport.h"
 #include "../terminal/SimulatedTerminalAdapter.h"
+#include "../terminal/VerifoneVx680SimulatorAdapter.h"
 #include "../terminal/Vx680UnverifiedAdapter.h"
 
 #include <winsock2.h>
@@ -26,6 +27,7 @@ void configureDefaultSimulatedTerminal(paybridge::terminal::TerminalManager& man
     terminal.adapterId = paybridge::terminal::SimulatedTerminalAdapter::ID;
     manager.registerAdapter(std::make_shared<paybridge::terminal::SimulatedTerminalAdapter>());
     manager.registerAdapter(std::make_shared<paybridge::terminal::Vx680UnverifiedAdapter>());
+    manager.registerAdapter(std::make_shared<paybridge::terminal::VerifoneVx680SimulatorAdapter>());
     manager.registerTerminal(terminal);
     manager.setTransport(terminal.terminalId,
         std::make_unique<paybridge::terminal::SimulatedTerminalTransport>(

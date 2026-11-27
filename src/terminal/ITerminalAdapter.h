@@ -10,6 +10,13 @@
 namespace paybridge::terminal
 {
 
+struct AdapterPreflightResult
+{
+    bool ready = true;
+    std::string resultCode;
+    std::string message;
+};
+
 // An adapter owns terminal-specific request encoding and response parsing.
 // The supplied transport is already open and provides byte communication only.
 // Implementations may be called concurrently for different terminal IDs and
@@ -23,6 +30,15 @@ public:
 
     virtual std::string adapterId() const = 0;
     virtual bool supports(const TerminalModel& terminal) const = 0;
+
+    // Called before the manager inspects or opens the transport.
+    // Existing adapters are ready by default.
+    virtual AdapterPreflightResult preflight(
+        const TerminalModel&,
+        const transport::ITransport&) const
+    {
+        return {};
+    }
 
     // Called while the selected terminal's operation lock is held. Call
     // beforeSend immediately before the first send attempt. Set
