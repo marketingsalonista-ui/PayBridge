@@ -77,6 +77,20 @@ PaymentOrchestrationResult PaymentOrchestrationService::process(
     operation.amount = transaction.money;
     operation.asset = transaction.asset;
 
+    // The terminal has already been contacted when this runs. If its outcome
+    // cannot be recorded, report UNKNOWN rather than REJECTED so that no caller
+    // treats the payment as safely retryable. Recording UNKNOWN is best effort:
+    // the response is UNKNOWN either way, and a replay never resends.
+    const auto unresolvedAfterSend = [&](const char* detail)
+    {
+        engine.updateStatusForRequest(transaction, TransactionStatus::UNKNOWN,
+            replay.requestId, ReplayState::UNKNOWN, "UNKNOWN",
+            "PERSISTENCE_FAILURE_AFTER_SEND", detail,
+            "Terminal outcome could not be persisted; automatic resend is disabled");
+        return resultFor(transaction, "UNKNOWN", "PERSISTENCE_FAILURE_AFTER_SEND",
+            "SIMULATED result is unresolved; automatic resend is disabled", terminalId);
+    };
+
     bool sentStatePersisted = false;
     const auto terminalResult = terminals.executeOperation(operation, [&]()
     {
@@ -125,8 +139,8 @@ PaymentOrchestrationResult PaymentOrchestrationService::process(
     if (!engine.updateStatusForRequest(transaction, TransactionStatus::RECEIVED,
         replay.requestId, ReplayState::PROCESSING, "RECEIVED", "SIMULATED_RESPONSE_RECEIVED",
         "Correlated simulated response received; no real payment was processed"))
-        return resultFor(transaction, "REJECTED", "PERSISTENCE_FAILURE",
-            "Simulated response received but receipt state could not be persisted", terminalId);
+        return unresolvedAfterSend(
+            "Simulated response received but receipt state could not be persisted");
 
     const bool approved = terminalResult.outcome == TerminalOperationOutcome::APPROVED;
     const auto finalStatus = approved ? TransactionStatus::APPROVED : TransactionStatus::DECLINED;
@@ -134,8 +148,7 @@ PaymentOrchestrationResult PaymentOrchestrationService::process(
     const std::string resultCode = approved ? "SIMULATED_APPROVED" : "SIMULATED_DECLINED";
     if (!engine.updateStatusForRequest(transaction, finalStatus, replay.requestId,
         ReplayState::COMPLETED, finalStatusText, resultCode, terminalResult.message))
-        return resultFor(transaction, "REJECTED", "PERSISTENCE_FAILURE",
-            "Simulated outcome could not be persisted", terminalId);
+        return unresolvedAfterSend("Simulated outcome could not be persisted");
     return resultFor(transaction, finalStatusText, resultCode,
         terminalResult.message, terminalId);
 }

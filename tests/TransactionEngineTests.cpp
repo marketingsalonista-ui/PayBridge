@@ -1554,6 +1554,107 @@ int main()
         }
     }
 
+    // A persistence failure AFTER the terminal was contacted must be reported
+    // as UNKNOWN (never REJECTED) and must never cause a resend. Failures are
+    // injected with a SQLite trigger installed from a second connection, so no
+    // production test seam is needed.
+    {
+        using namespace paybridge::terminal;
+        struct PostSendScenario
+        {
+            const char* name;
+            const char* blockedStates;          // SQL list the trigger rejects
+            TransactionStatus expectedStored;   // authoritative row afterwards
+            const char* expectedReplayStatus;
+        };
+        const PostSendScenario scenarios[] = {
+            {"receipt write fails",            "'RECEIVED'",           TransactionStatus::UNKNOWN,  "UNKNOWN"},
+            {"final write fails",              "'APPROVED'",           TransactionStatus::UNKNOWN,  "UNKNOWN"},
+            {"receipt and UNKNOWN writes fail","'RECEIVED','UNKNOWN'", TransactionStatus::SENT,     "PROCESSING"},
+            {"final and UNKNOWN writes fail",  "'APPROVED','UNKNOWN'", TransactionStatus::RECEIVED, "PROCESSING"},
+        };
+
+        std::size_t scenarioNumber = 0;
+        for (const auto& scenario : scenarios)
+        {
+            ++scenarioNumber;
+            const std::string dbPath = (suiteRoot /
+                ("post_send_persistence_" + std::to_string(scenarioNumber) + ".sqlite")).string();
+            TransactionEngine engine(dbPath, std::string{});
+            const bool engineReady = engine.initialize();
+            assert(engineReady);
+            (void)engineReady;
+
+            sqlite3* injector = nullptr;
+            const int openResult = sqlite3_open(dbPath.c_str(), &injector);
+            assert(openResult == SQLITE_OK);
+            (void)openResult;
+            const std::string triggerSql =
+                std::string("CREATE TRIGGER test_block_states BEFORE UPDATE ON transactions "
+                            "WHEN NEW.lifecycle_state IN (") + scenario.blockedStates +
+                ") BEGIN SELECT RAISE(ABORT, 'injected persistence failure'); END;";
+            char* triggerError = nullptr;
+            const int triggerResult = sqlite3_exec(injector, triggerSql.c_str(),
+                nullptr, nullptr, &triggerError);
+            if (triggerError)
+            {
+                std::cerr << "Trigger install failed (" << scenario.name << "): "
+                          << triggerError << "\n";
+                sqlite3_free(triggerError);
+            }
+            assert(triggerResult == SQLITE_OK);
+            (void)triggerResult;
+            sqlite3_close(injector);
+
+            const auto aed = engine.assets().findFiat("AED");
+            assert(aed);
+
+            TerminalManager terminals;
+            TerminalModel terminal;
+            terminal.terminalId = "SIM-POST-SEND-" + std::to_string(scenarioNumber);
+            terminal.transportKind = TransportKind::SIMULATED;
+            terminals.registerTerminal(terminal);
+            terminals.registerAdapter(std::make_shared<SimulatedTerminalAdapter>());
+            auto sendCount = std::make_shared<std::atomic<int>>(0);
+            terminals.setTransport(terminal.terminalId,
+                std::make_unique<CountingSimulatedTransport>(
+                    SimulatedTerminalOutcome::APPROVED, sendCount));
+            PaymentOrchestrationService service(engine, terminals);
+
+            PaymentRequest request;
+            request.envelope.requestId.assign(32, '0');
+            request.envelope.requestId[0] = '5';
+            request.envelope.requestId[31] = static_cast<char>('0' + scenarioNumber);
+            request.envelope.requestTimestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            request.envelope.requestExpiry = request.envelope.requestTimestamp + 300;
+            request.externalReference = "SIM-POST-SEND-REF-" + std::to_string(scenarioNumber);
+            request.asset = *aed;
+            request.money = {500, aed->decimalPrecision};
+            request.canonicalRequestHash = "canonical-post-send-" + std::to_string(scenarioNumber);
+            request.paymentFingerprint = "fingerprint-post-send-" + std::to_string(scenarioNumber);
+
+            const auto result = service.process(request);
+            if (result.status != "UNKNOWN")
+                std::cerr << "Post-send scenario '" << scenario.name << "' returned "
+                          << result.status << " (" << result.errorCode << ")\n";
+            assert(result.status == "UNKNOWN");
+            assert(result.errorCode == "PERSISTENCE_FAILURE_AFTER_SEND");
+            assert(result.message.find("automatic resend is disabled") != std::string::npos);
+            assert(result.simulated);
+            assert(*sendCount == 1);
+
+            const auto stored = engine.findTransactionById(result.transactionId);
+            assert(stored.has_value());
+            assert(stored->status == scenario.expectedStored);
+
+            const auto replay = service.process(request);
+            assert(replay.status == scenario.expectedReplayStatus);
+            assert(replay.transactionId == result.transactionId);
+            assert(*sendCount == 1);
+        }
+    }
+
     // Existing v1 SQLite databases upgrade in place and retain transaction/replay rows.
     {
         const std::string migrationDb = (suiteRoot / "schema_v1_upgrade.sqlite").string();
