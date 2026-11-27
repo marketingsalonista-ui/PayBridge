@@ -1211,16 +1211,29 @@ int main()
         assert(parsed.terminalId == simulatedRequest.terminalId);
         assert(parsed.simulated);
 
+        assert(approvedResponse.data.size() >= 4);
+        const std::vector<std::uint8_t> responseHeader(
+            approvedResponse.data.begin(), approvedResponse.data.begin() + 4);
+        const auto responseLength =
+            SimulatedTerminalProtocol::decodeFrameLength(responseHeader);
+        assert(responseLength.has_value());
+        assert(approvedResponse.data.size() == 4 + *responseLength);
+
+        const std::vector<std::uint8_t> responsePayload(
+            approvedResponse.data.begin() + 4, approvedResponse.data.end());
         auto mismatchedResponse = nlohmann::json::parse(
-            approvedResponse.data.begin(), approvedResponse.data.end());
+            responsePayload.begin(), responsePayload.end());
+
         for (const auto& field : {"request_id", "transaction_id", "external_reference", "terminal_id"})
         {
             auto tampered = mismatchedResponse;
             tampered[field] = "MISMATCH";
             const std::string text = tampered.dump();
-            const std::vector<std::uint8_t> bytes(text.begin(), text.end());
-            assert(!protocol.validateResponse(bytes, simulatedRequest));
-            assert(protocol.parseResponse(bytes, simulatedRequest).outcome == SimulatedTerminalOutcome::MALFORMED);
+            const std::vector<std::uint8_t> payload(text.begin(), text.end());
+            const auto framedBytes = SimulatedTerminalProtocol::framePayload(payload);
+            assert(!protocol.validateResponse(framedBytes, simulatedRequest));
+            assert(protocol.parseResponse(framedBytes, simulatedRequest).outcome ==
+                SimulatedTerminalOutcome::MALFORMED);
         }
         approved.close();
         assert(!approved.isOpen());

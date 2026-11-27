@@ -73,7 +73,39 @@ std::vector<std::uint8_t> SimulatedTerminalProtocol::encodeResponse(
         {"terminal_id", request.terminalId}
     };
     const std::string text = data.dump();
-    return {text.begin(), text.end()};
+    const std::vector<std::uint8_t> payload(text.begin(), text.end());
+    return framePayload(payload);
+}
+
+std::vector<std::uint8_t> SimulatedTerminalProtocol::framePayload(
+    const std::vector<std::uint8_t>& payload)
+{
+    if (payload.empty() || payload.size() > 65536) return {};
+
+    const std::uint32_t length = static_cast<std::uint32_t>(payload.size());
+    std::vector<std::uint8_t> frame;
+    frame.reserve(4 + payload.size());
+    frame.push_back(static_cast<std::uint8_t>((length >> 24) & 0xFF));
+    frame.push_back(static_cast<std::uint8_t>((length >> 16) & 0xFF));
+    frame.push_back(static_cast<std::uint8_t>((length >> 8) & 0xFF));
+    frame.push_back(static_cast<std::uint8_t>(length & 0xFF));
+    frame.insert(frame.end(), payload.begin(), payload.end());
+    return frame;
+}
+
+std::optional<std::size_t> SimulatedTerminalProtocol::decodeFrameLength(
+    const std::vector<std::uint8_t>& header)
+{
+    if (header.size() != 4) return std::nullopt;
+
+    const std::uint32_t length =
+        (static_cast<std::uint32_t>(header[0]) << 24) |
+        (static_cast<std::uint32_t>(header[1]) << 16) |
+        (static_cast<std::uint32_t>(header[2]) << 8) |
+        static_cast<std::uint32_t>(header[3]);
+
+    if (length == 0 || length > 65536) return std::nullopt;
+    return static_cast<std::size_t>(length);
 }
 
 bool SimulatedTerminalProtocol::validateRequest(
@@ -87,10 +119,16 @@ bool SimulatedTerminalProtocol::validateRequest(
 std::optional<SimulatedTerminalResponse> SimulatedTerminalProtocol::decodeResponse(
     const std::vector<std::uint8_t>& payload)
 {
-    if (payload.empty() || payload.size() > 65536) return std::nullopt;
+    if (payload.size() < 5 || payload.size() > 65540) return std::nullopt;
+
+    const std::vector<std::uint8_t> header(payload.begin(), payload.begin() + 4);
+    const auto frameLength = decodeFrameLength(header);
+    if (!frameLength || payload.size() != 4 + *frameLength) return std::nullopt;
+
+    const auto bodyBegin = payload.begin() + 4;
     try
     {
-        const Json data = Json::parse(payload.begin(), payload.end());
+        const Json data = Json::parse(bodyBegin, payload.end());
         if (!data.is_object() || data.value("simulation_contract", std::string{}) != CONTRACT ||
             !data.value("simulated", false)) return std::nullopt;
 

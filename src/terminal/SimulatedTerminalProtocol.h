@@ -21,6 +21,13 @@ public:
         const SimulatedTerminalRequest& request,
         SimulatedTerminalOutcome outcome);
 
+    // Internal simulator response framing: 4-byte big-endian payload length.
+    static std::vector<std::uint8_t> framePayload(
+        const std::vector<std::uint8_t>& payload);
+
+    static std::optional<std::size_t> decodeFrameLength(
+        const std::vector<std::uint8_t>& header);
+
     bool validateRequest(const SimulatedTerminalRequest& request,
         const std::vector<std::uint8_t>& payload) const override;
 

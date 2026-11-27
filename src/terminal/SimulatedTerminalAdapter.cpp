@@ -55,12 +55,53 @@ TerminalOperationResult SimulatedTerminalAdapter::execute(
     if (!sent.success)
         return resultFor(request, TerminalOperationOutcome::UNKNOWN,
             "SIMULATED_TRANSPORT_FAILURE", "request send outcome is uncertain", true);
-    const auto received = byteTransport.receive(65536);
-    if (!received.result.success)
-        return resultFor(request, TerminalOperationOutcome::UNKNOWN,
-            "SIMULATED_OUTCOME_UNKNOWN", "terminal result is unresolved", true);
+    // Read the 4-byte frame header, then the declared payload.
+    std::vector<std::uint8_t> responseFrame;
+    responseFrame.reserve(65540);
 
-    const auto response = SimulatedTerminalProtocol::decodeResponse(received.data);
+    while (responseFrame.size() < 4)
+    {
+        const std::size_t remaining = 4 - responseFrame.size();
+        const auto received = byteTransport.receive(remaining);
+
+        if (!received.result.success || received.data.empty() ||
+            received.data.size() > remaining)
+            return resultFor(request, TerminalOperationOutcome::UNKNOWN,
+                "SIMULATED_RESPONSE_HEADER_INCOMPLETE",
+                "response header is incomplete", true);
+
+        responseFrame.insert(responseFrame.end(),
+            received.data.begin(), received.data.end());
+    }
+
+    const std::vector<std::uint8_t> header(
+        responseFrame.begin(), responseFrame.begin() + 4);
+    const auto frameLength = SimulatedTerminalProtocol::decodeFrameLength(header);
+
+    if (!frameLength)
+        return resultFor(request, TerminalOperationOutcome::UNKNOWN,
+            "SIMULATED_RESPONSE_INVALID_LENGTH",
+            "response frame length is invalid", true);
+
+    const std::size_t expectedSize = 4 + *frameLength;
+
+    while (responseFrame.size() < expectedSize)
+    {
+        const std::size_t remaining = expectedSize - responseFrame.size();
+        const auto received = byteTransport.receive(remaining);
+
+        if (!received.result.success || received.data.empty() ||
+            received.data.size() > remaining)
+            return resultFor(request, TerminalOperationOutcome::UNKNOWN,
+                "SIMULATED_RESPONSE_BODY_INCOMPLETE",
+                "response body is incomplete", true);
+
+        responseFrame.insert(responseFrame.end(),
+            received.data.begin(), received.data.end());
+    }
+
+    const auto response =
+        SimulatedTerminalProtocol::decodeResponse(responseFrame);
     if (!response)
         return resultFor(request, TerminalOperationOutcome::UNKNOWN,
             "SIMULATED_RESPONSE_INVALID", "terminal response is unresolved", true);

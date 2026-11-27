@@ -57,12 +57,13 @@ transport::TransportBytes SimulatedTerminalPeer::respond(
     case SimulatedTerminalOutcome::MALFORMED:
     {
         static const std::string malformed = "%%% MALFORMED-SIMULATION %%%";
-        if (malformed.size() > maximumBytes)
+        const std::vector<std::uint8_t> payload(malformed.begin(), malformed.end());
+        const auto frame = SimulatedTerminalProtocol::framePayload(payload);
+        if (frame.empty() || frame.size() > maximumBytes)
             return {{false, transport::TransportError::SIZE_LIMIT,
                 "SIMULATED malformed response exceeds receive limit"}, {}};
         return {{true, transport::TransportError::NONE,
-            "SIMULATED malformed response"},
-            {malformed.begin(), malformed.end()}};
+            "SIMULATED malformed response"}, frame};
     }
     }
     return {{false, transport::TransportError::MALFORMED_RESPONSE,

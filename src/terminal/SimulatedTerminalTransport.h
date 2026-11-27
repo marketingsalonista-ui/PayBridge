@@ -35,6 +35,9 @@ private:
     std::uint32_t sendTimeoutMilliseconds = 10000;
     std::shared_ptr<SimulatedTerminalPeer> peer;
     std::vector<std::uint8_t> lastRequest;
+    std::vector<std::uint8_t> pendingResponse;
+    std::size_t pendingResponseOffset = 0;
+    bool responseReady = false;
 };
 
 } // namespace paybridge::terminal

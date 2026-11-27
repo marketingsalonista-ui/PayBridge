@@ -118,7 +118,8 @@ private:
 class TamperedResponseTransport final : public paybridge::transport::ITransport
 {
 public:
-    explicit TamperedResponseTransport(int field) : field(field) {}
+    explicit TamperedResponseTransport(int field, std::size_t chunkSize = 65536)
+        : field(field), chunkSize(chunkSize) {}
     paybridge::transport::TransportResult open() override { openState = true; return {true}; }
     void close() noexcept override { openState = false; }
     bool isOpen() const noexcept override { return openState; }
@@ -131,18 +132,32 @@ public:
         if (field == 2) request->externalReference += "x";
         if (field == 3) request->terminalId += "x";
         response = SimulatedTerminalProtocol::encodeResponse(*request, SimulatedTerminalOutcome::APPROVED);
+        responseOffset = 0;
         return {true};
     }
     paybridge::transport::TransportBytes receive(std::size_t maximum) override
     {
-        if (response.size() > maximum) return {{false, paybridge::transport::TransportError::SIZE_LIMIT, "too large"}, {}};
-        return {{true}, response};
+        if (!openState || maximum == 0 || responseOffset >= response.size())
+            return {{false, paybridge::transport::TransportError::DISCONNECTED, "no response bytes available"}, {}};
+
+        const std::size_t remaining = response.size() - responseOffset;
+        const std::size_t count = (maximum < chunkSize)
+            ? ((maximum < remaining) ? maximum : remaining)
+            : ((chunkSize < remaining) ? chunkSize : remaining);
+
+        std::vector<std::uint8_t> chunk(
+            response.begin() + responseOffset,
+            response.begin() + responseOffset + count);
+        responseOffset += count;
+        return {{true}, std::move(chunk)};
     }
     void setReceiveTimeoutMilliseconds(std::uint32_t) noexcept override {}
     void setSendTimeoutMilliseconds(std::uint32_t) noexcept override {}
     std::string description() const override { return "test response transport"; }
 private:
     int field;
+    std::size_t chunkSize;
+    std::size_t responseOffset = 0;
     bool openState = false;
     std::vector<std::uint8_t> response;
 };
@@ -483,6 +498,50 @@ private:
 };
 }
 
+// Serves scripted bytes so framing failures can be tested.
+class ScriptedResponseTransport final : public paybridge::transport::ITransport
+{
+public:
+    explicit ScriptedResponseTransport(std::vector<std::uint8_t> bytes,
+        std::size_t chunkSize = 65536, bool ignoreMaximum = false,
+        bool emptySuccessWhenExhausted = false)
+        : script(std::move(bytes)), chunkSize(chunkSize),
+          ignoreMaximum(ignoreMaximum), emptySuccessWhenExhausted(emptySuccessWhenExhausted) {}
+    paybridge::transport::TransportResult open() override { openState = true; return {true}; }
+    void close() noexcept override { openState = false; }
+    bool isOpen() const noexcept override { return openState; }
+    paybridge::transport::TransportResult send(const std::vector<std::uint8_t>&) override
+    {
+        return {true};
+    }
+    paybridge::transport::TransportBytes receive(std::size_t maximum) override
+    {
+        if (offset >= script.size())
+        {
+            if (emptySuccessWhenExhausted) return {{true}, {}};
+            return {{false, paybridge::transport::TransportError::DISCONNECTED,
+                "script exhausted"}, {}};
+        }
+        std::size_t count = script.size() - offset;
+        if (count > chunkSize) count = chunkSize;
+        if (!ignoreMaximum && count > maximum) count = maximum;
+        std::vector<std::uint8_t> chunk(
+            script.begin() + offset, script.begin() + offset + count);
+        offset += count;
+        return {{true}, std::move(chunk)};
+    }
+    void setReceiveTimeoutMilliseconds(std::uint32_t) noexcept override {}
+    void setSendTimeoutMilliseconds(std::uint32_t) noexcept override {}
+    std::string description() const override { return "scripted response transport"; }
+private:
+    std::vector<std::uint8_t> script;
+    std::size_t chunkSize;
+    bool ignoreMaximum;
+    bool emptySuccessWhenExhausted;
+    std::size_t offset = 0;
+    bool openState = false;
+};
+
 int main()
 {
     const TerminalOperationRequest request = validRequest();
@@ -571,7 +630,64 @@ int main()
         assert(uncorrelated.requestMayHaveBeenSent);
     }
 
-        // Exception before persistence.
+    // Verify response assembly when the transport returns 2-byte chunks.
+    {
+        TamperedResponseTransport fragmented(-1, 2);
+        assert(fragmented.open().success);
+        const auto fragmentedResult = adapter.execute(
+            request, fragmented, [] { return true; });
+        assert(fragmentedResult.outcome == TerminalOperationOutcome::APPROVED);
+        assert(fragmentedResult.simulated);
+        assert(fragmentedResult.correlatesTo(request));
+    }
+
+    // Malformed, truncated and oversized response frames must resolve to UNKNOWN.
+    {
+        const auto expectUnknown = [&](ScriptedResponseTransport& scripted, const char* code)
+        {
+            const bool opened = scripted.open().success;
+            assert(opened);
+            const auto result = adapter.execute(request, scripted, [] { return true; });
+            assert(result.outcome == TerminalOperationOutcome::UNKNOWN);
+            assert(result.resultCode == code);
+            assert(result.requestMayHaveBeenSent);
+            assert(result.simulated);
+            (void)opened;
+            (void)result;
+            (void)code;
+        };
+
+        const std::vector<std::uint8_t> shortHeader = {0x00, 0x00};
+        const std::vector<std::uint8_t> zeroLength = {0x00, 0x00, 0x00, 0x00};
+        const std::vector<std::uint8_t> tooLarge = {0x00, 0x01, 0x00, 0x01};
+        const std::vector<std::uint8_t> maxLengthNoBody = {0x00, 0x01, 0x00, 0x00};
+        const std::vector<std::uint8_t> truncatedBody =
+            {0x00, 0x00, 0x00, 0x0A, 0x61, 0x62, 0x63};
+        const std::string garbageText = "hello";
+        const std::vector<std::uint8_t> garbagePayload(garbageText.begin(), garbageText.end());
+        const auto garbageFrame = SimulatedTerminalProtocol::framePayload(garbagePayload);
+
+        { ScriptedResponseTransport t(shortHeader);
+          expectUnknown(t, "SIMULATED_RESPONSE_HEADER_INCOMPLETE"); }
+        { ScriptedResponseTransport t(zeroLength);
+          expectUnknown(t, "SIMULATED_RESPONSE_INVALID_LENGTH"); }
+        { ScriptedResponseTransport t(tooLarge);
+          expectUnknown(t, "SIMULATED_RESPONSE_INVALID_LENGTH"); }
+        { ScriptedResponseTransport t(maxLengthNoBody);
+          expectUnknown(t, "SIMULATED_RESPONSE_BODY_INCOMPLETE"); }
+        { ScriptedResponseTransport t(truncatedBody);
+          expectUnknown(t, "SIMULATED_RESPONSE_BODY_INCOMPLETE"); }
+        { ScriptedResponseTransport t(garbageFrame);
+          expectUnknown(t, "SIMULATED_RESPONSE_INVALID"); }
+        { ScriptedResponseTransport t(garbageFrame, 1);
+          expectUnknown(t, "SIMULATED_RESPONSE_INVALID"); }
+        { ScriptedResponseTransport t(garbageFrame, 65536, true);
+          expectUnknown(t, "SIMULATED_RESPONSE_HEADER_INCOMPLETE"); }
+        { ScriptedResponseTransport t(std::vector<std::uint8_t>{}, 65536, false, true);
+          expectUnknown(t, "SIMULATED_RESPONSE_HEADER_INCOMPLETE"); }
+    }
+
+    // Exception before persistence.
     {
         TerminalManager exceptionManager;
         TerminalModel terminal;
