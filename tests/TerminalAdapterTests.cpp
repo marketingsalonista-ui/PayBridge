@@ -311,6 +311,125 @@ private:
     std::atomic<int>& successfulCallbacks;
     bool unknownWithoutCallback;
 };
+// Counts send() calls so tests can prove whether bytes reached the transport.
+class SendCountingTransport final : public paybridge::transport::ITransport
+{
+public:
+    explicit SendCountingTransport(std::atomic<int>& sendCalls) : sendCalls(sendCalls) {}
+
+    paybridge::transport::TransportResult open() override { openState = true; return {true}; }
+    void close() noexcept override { openState = false; }
+    bool isOpen() const noexcept override { return openState; }
+
+    paybridge::transport::TransportResult send(
+        const std::vector<std::uint8_t>&) override
+    {
+        ++sendCalls;
+        return {true};
+    }
+
+    paybridge::transport::TransportBytes receive(std::size_t) override
+    {
+        return {{true}, {0x02}};
+    }
+
+    void setReceiveTimeoutMilliseconds(std::uint32_t) noexcept override {}
+    void setSendTimeoutMilliseconds(std::uint32_t) noexcept override {}
+    std::string description() const override { return "send-counting test transport"; }
+
+private:
+    std::atomic<int>& sendCalls;
+    bool openState = false;
+};
+
+// Models a non-conforming adapter that calls beforeSend but ignores a false
+// (persistence rejected) result and still reports APPROVED.
+class PersistenceIgnoringAdapter final : public ITerminalAdapter
+{
+public:
+    explicit PersistenceIgnoringAdapter(bool sendAnyway) : sendAnyway(sendAnyway) {}
+
+    std::string adapterId() const override { return "test.persistence-ignoring.v1"; }
+
+    bool supports(const TerminalModel& terminal) const override
+    {
+        return terminal.transportKind == TransportKind::SIMULATED;
+    }
+
+    TerminalOperationResult execute(const TerminalOperationRequest& request,
+        paybridge::transport::ITransport& transport,
+        const BeforeSend& beforeSend) const override
+    {
+        const bool persisted = beforeSend && beforeSend();
+        (void)persisted; // Deliberately ignored: this adapter violates the contract.
+        if (sendAnyway) transport.send(std::vector<std::uint8_t>{0x01});
+        auto result = resultFor(request); // APPROVED
+        result.requestMayHaveBeenSent = sendAnyway;
+        return result;
+    }
+
+private:
+    bool sendAnyway;
+};
+
+// Retries beforeSend after the first (rejected) attempt. The manager's guard
+// must never let a later attempt succeed.
+class RetryAfterRejectionAdapter final : public ITerminalAdapter
+{
+public:
+    explicit RetryAfterRejectionAdapter(std::atomic<int>& successfulCallbacks)
+        : successfulCallbacks(successfulCallbacks) {}
+
+    std::string adapterId() const override { return "test.retry-after-rejection.v1"; }
+
+    bool supports(const TerminalModel& terminal) const override
+    {
+        return terminal.transportKind == TransportKind::SIMULATED;
+    }
+
+    TerminalOperationResult execute(const TerminalOperationRequest& request,
+        paybridge::transport::ITransport&, const BeforeSend& beforeSend) const override
+    {
+        int successes = 0;
+        for (int attempt = 0; attempt < 3; ++attempt)
+            if (beforeSend && beforeSend()) ++successes;
+        successfulCallbacks = successes;
+
+        auto result = resultFor(request);
+        result.outcome = TerminalOperationOutcome::FAILED;
+        result.resultCode = "TEST_PERSISTENCE_REJECTED";
+        result.requestMayHaveBeenSent = false;
+        return result;
+    }
+
+private:
+    std::atomic<int>& successfulCallbacks;
+};
+
+// Sends bytes without ever calling beforeSend, then reports a clean FAILED.
+class BeforeSendBypassingAdapter final : public ITerminalAdapter
+{
+public:
+    std::string adapterId() const override { return "test.beforesend-bypass.v1"; }
+
+    bool supports(const TerminalModel& terminal) const override
+    {
+        return terminal.transportKind == TransportKind::SIMULATED;
+    }
+
+    TerminalOperationResult execute(const TerminalOperationRequest& request,
+        paybridge::transport::ITransport& transport,
+        const BeforeSend&) const override
+    {
+        transport.send(std::vector<std::uint8_t>{0x01});
+        auto result = resultFor(request);
+        result.outcome = TerminalOperationOutcome::FAILED;
+        result.resultCode = "TEST_SEND_WITHOUT_PERSISTENCE";
+        result.requestMayHaveBeenSent = false;
+        return result;
+    }
+};
+
 class BlockingTestAdapter final : public ITerminalAdapter
 {
 public:
@@ -654,6 +773,122 @@ int main()
         assert(persistenceCalls == 1);
         assert(successfulCallbacks == 1);
     }
+    // beforeSend is invoked but rejected (persistence failed), yet a
+    // non-conforming adapter still reports APPROVED. The manager must never
+    // surface that approval, and must stay UNKNOWN rather than FAILED so the
+    // caller does not treat the payment as safely retryable.
+    for (const bool sendAnyway : {true, false})
+    {
+        std::atomic<int> sendCalls{0};
+        TerminalManager contractManager;
+        TerminalModel terminal;
+        terminal.terminalId = sendAnyway ? "SIM-PERSIST-REJECTED-SENT" : "SIM-PERSIST-REJECTED-UNSENT";
+        terminal.transportKind = TransportKind::SIMULATED;
+        terminal.adapterId = "test.persistence-ignoring.v1";
+
+        const bool adapterRegistered = contractManager.registerAdapter(
+            std::make_shared<PersistenceIgnoringAdapter>(sendAnyway));
+        const bool terminalRegistered = contractManager.registerTerminal(terminal);
+        assert(adapterRegistered && terminalRegistered);
+        (void)adapterRegistered; (void)terminalRegistered;
+        contractManager.setTransport(terminal.terminalId,
+            std::make_unique<SendCountingTransport>(sendCalls));
+
+        auto testRequest = request;
+        testRequest.terminalId = terminal.terminalId;
+
+        int persistenceCalls = 0;
+        const auto result = contractManager.executeOperation(
+            testRequest, [&]()
+            {
+                ++persistenceCalls;
+                return false;
+            });
+
+        assert(persistenceCalls == 1);
+        assert(result.outcome == TerminalOperationOutcome::UNKNOWN);
+        assert(result.resultCode == "ADAPTER_RESULT_INVALID");
+        assert(result.requestMayHaveBeenSent);
+        assert(result.correlatesTo(testRequest));
+        // Characterizes what actually reached the transport in each variant.
+        assert(sendCalls == (sendAnyway ? 1 : 0));
+    }
+
+    // A rejected persistence attempt must not be retryable: later beforeSend
+    // calls fail without re-invoking the persistence callback.
+    {
+        std::atomic<int> sendCalls{0};
+        std::atomic<int> successfulCallbacks{-1};
+        TerminalManager contractManager;
+        TerminalModel terminal;
+        terminal.terminalId = "SIM-PERSIST-NO-RETRY";
+        terminal.transportKind = TransportKind::SIMULATED;
+        terminal.adapterId = "test.retry-after-rejection.v1";
+
+        const bool adapterRegistered = contractManager.registerAdapter(
+            std::make_shared<RetryAfterRejectionAdapter>(successfulCallbacks));
+        const bool terminalRegistered = contractManager.registerTerminal(terminal);
+        assert(adapterRegistered && terminalRegistered);
+        (void)adapterRegistered; (void)terminalRegistered;
+        contractManager.setTransport(terminal.terminalId,
+            std::make_unique<SendCountingTransport>(sendCalls));
+
+        auto testRequest = request;
+        testRequest.terminalId = terminal.terminalId;
+
+        int persistenceCalls = 0;
+        const auto result = contractManager.executeOperation(
+            testRequest, [&]()
+            {
+                ++persistenceCalls;
+                return false;
+            });
+
+        assert(persistenceCalls == 1);
+        assert(successfulCallbacks == 0);
+        assert(sendCalls == 0);
+        assert(result.outcome == TerminalOperationOutcome::FAILED);
+        assert(!result.requestMayHaveBeenSent);
+    }
+
+    // KNOWN LIMITATION (characterization test, not desired behavior): the
+    // manager passes the raw transport to the adapter, so an adapter that
+    // sends WITHOUT calling beforeSend and reports FAILED is returned as a
+    // clean FAILED even though bytes reached the terminal. A transport guard
+    // that blocks send() until beforeSend passes would close this; when it is
+    // added, change these expectations to UNKNOWN / zero sends.
+    {
+        std::atomic<int> sendCalls{0};
+        TerminalManager contractManager;
+        TerminalModel terminal;
+        terminal.terminalId = "SIM-BEFORESEND-BYPASS";
+        terminal.transportKind = TransportKind::SIMULATED;
+        terminal.adapterId = "test.beforesend-bypass.v1";
+
+        const bool adapterRegistered = contractManager.registerAdapter(
+            std::make_shared<BeforeSendBypassingAdapter>());
+        const bool terminalRegistered = contractManager.registerTerminal(terminal);
+        assert(adapterRegistered && terminalRegistered);
+        (void)adapterRegistered; (void)terminalRegistered;
+        contractManager.setTransport(terminal.terminalId,
+            std::make_unique<SendCountingTransport>(sendCalls));
+
+        auto testRequest = request;
+        testRequest.terminalId = terminal.terminalId;
+
+        int persistenceCalls = 0;
+        const auto result = contractManager.executeOperation(
+            testRequest, [&]()
+            {
+                ++persistenceCalls;
+                return true;
+            });
+
+        assert(persistenceCalls == 0);
+        assert(sendCalls == 1);                                   // bytes were sent
+        assert(result.outcome == TerminalOperationOutcome::FAILED); // ...but reported FAILED
+    }
+
     // A transport open exception must not escape the operation boundary.
     {
         TerminalManager openExceptionManager;
