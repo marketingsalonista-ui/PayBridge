@@ -810,8 +810,8 @@ int main()
         assert(result.resultCode == "ADAPTER_RESULT_INVALID");
         assert(result.requestMayHaveBeenSent);
         assert(result.correlatesTo(testRequest));
-        // Characterizes what actually reached the transport in each variant.
-        assert(sendCalls == (sendAnyway ? 1 : 0));
+        // The transport guard blocks sends when persistence is rejected.
+        assert(sendCalls == 0);
     }
 
     // A rejected persistence attempt must not be retryable: later beforeSend
@@ -851,12 +851,8 @@ int main()
         assert(!result.requestMayHaveBeenSent);
     }
 
-    // KNOWN LIMITATION (characterization test, not desired behavior): the
-    // manager passes the raw transport to the adapter, so an adapter that
-    // sends WITHOUT calling beforeSend and reports FAILED is returned as a
-    // clean FAILED even though bytes reached the terminal. A transport guard
-    // that blocks send() until beforeSend passes would close this; when it is
-    // added, change these expectations to UNKNOWN / zero sends.
+    // A non-conforming adapter cannot bypass pre-send persistence by sending
+    // directly through the transport.
     {
         std::atomic<int> sendCalls{0};
         TerminalManager contractManager;
@@ -885,8 +881,9 @@ int main()
             });
 
         assert(persistenceCalls == 0);
-        assert(sendCalls == 1);                                   // bytes were sent
-        assert(result.outcome == TerminalOperationOutcome::FAILED); // ...but reported FAILED
+        assert(sendCalls == 0);
+        assert(result.outcome == TerminalOperationOutcome::FAILED);
+        assert(!result.requestMayHaveBeenSent);
     }
 
     // A transport open exception must not escape the operation boundary.

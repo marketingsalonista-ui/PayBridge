@@ -1,12 +1,60 @@
 #include "TerminalManager.h"
 
 #include <algorithm>
+#include <atomic>
 #include <exception>
 
 namespace paybridge::terminal
 {
 namespace
 {
+class GuardedTransport final : public transport::ITransport
+{
+public:
+    GuardedTransport(transport::ITransport& underlying,
+        const std::atomic<bool>& sendAuthorized)
+        : underlying(underlying), sendAuthorized(sendAuthorized) {}
+
+    transport::TransportResult open() override { return underlying.open(); }
+    void close() noexcept override { underlying.close(); }
+    bool isOpen() const noexcept override { return underlying.isOpen(); }
+
+    transport::TransportResult send(
+        const std::vector<std::uint8_t>& bytes) override
+    {
+        if (!sendAuthorized.load())
+        {
+            return {
+                false,
+                transport::TransportError::INVALID_ARGUMENT,
+                "Send blocked: pre-send persistence has not succeeded"
+            };
+        }
+        return underlying.send(bytes);
+    }
+
+    transport::TransportBytes receive(std::size_t maximumBytes) override
+    {
+        return underlying.receive(maximumBytes);
+    }
+
+    void setReceiveTimeoutMilliseconds(std::uint32_t milliseconds) noexcept override
+    {
+        underlying.setReceiveTimeoutMilliseconds(milliseconds);
+    }
+
+    void setSendTimeoutMilliseconds(std::uint32_t milliseconds) noexcept override
+    {
+        underlying.setSendTimeoutMilliseconds(milliseconds);
+    }
+
+    std::string description() const override { return underlying.description(); }
+
+private:
+    transport::ITransport& underlying;
+    const std::atomic<bool>& sendAuthorized;
+};
+
 bool adapterSupports(const std::shared_ptr<ITerminalAdapter>& adapter,
     const TerminalModel& terminal) noexcept
 {
@@ -273,40 +321,42 @@ TerminalOperationResult TerminalManager::executeOperation(
         if (!opened.success)
             return failure(TerminalOperationOutcome::FAILED, "TERMINAL_CONNECT_FAILED", "Terminal connection failed");
     }
-    bool beforeSendAttempted = false;
-    bool beforeSendPassed = false;
+    std::atomic<bool> beforeSendAttempted{false};
+    std::atomic<bool> beforeSendPassed{false};
     const ITerminalAdapter::BeforeSend guardedBeforeSend = [&]()
     {
-        if (beforeSendAttempted) return false;
-        beforeSendAttempted = true;
+        if (beforeSendAttempted.exchange(true)) return false;
         if (!beforeSend || !beforeSend()) return false;
-        beforeSendPassed = true;
+        beforeSendPassed.store(true);
         return true;
     };
+
+    GuardedTransport guardedTransport(*byteTransport, beforeSendPassed);
+
     TerminalOperationResult result;
-    try { result = adapter->execute(request, *byteTransport, guardedBeforeSend); }
+    try { result = adapter->execute(request, guardedTransport, guardedBeforeSend); }
     catch (...)
     {
-        return failure(beforeSendPassed ? TerminalOperationOutcome::UNKNOWN : TerminalOperationOutcome::FAILED,
-            beforeSendPassed ? "ADAPTER_OUTCOME_UNKNOWN" : "ADAPTER_FAILURE",
-            beforeSendPassed ? "Adapter failed after pre-send persistence; outcome is unresolved"
-                             : "Adapter failed before terminal operation", beforeSendPassed);
+        return failure(beforeSendPassed.load() ? TerminalOperationOutcome::UNKNOWN : TerminalOperationOutcome::FAILED,
+            beforeSendPassed.load() ? "ADAPTER_OUTCOME_UNKNOWN" : "ADAPTER_FAILURE",
+            beforeSendPassed.load() ? "Adapter failed after pre-send persistence; outcome is unresolved"
+                             : "Adapter failed before terminal operation", beforeSendPassed.load());
     }
     if (!result.correlatesTo(request))
-        return failure((result.requestMayHaveBeenSent || beforeSendPassed) ? TerminalOperationOutcome::UNKNOWN
+        return failure((result.requestMayHaveBeenSent || beforeSendPassed.load()) ? TerminalOperationOutcome::UNKNOWN
                 : TerminalOperationOutcome::FAILED,
             "ADAPTER_RESPONSE_UNCORRELATED", "Adapter result correlation failed",
-            result.requestMayHaveBeenSent || beforeSendPassed);
+            result.requestMayHaveBeenSent || beforeSendPassed.load());
     if ((result.outcome == TerminalOperationOutcome::APPROVED ||
      result.outcome == TerminalOperationOutcome::DECLINED) &&
-    (!result.requestMayHaveBeenSent || !beforeSendPassed))
+    (!result.requestMayHaveBeenSent || !beforeSendPassed.load()))
         return failure(TerminalOperationOutcome::UNKNOWN,
             "ADAPTER_RESULT_INVALID", "Adapter returned an outcome without a persisted send", true);
     if (result.outcome == TerminalOperationOutcome::FAILED &&
-        (result.requestMayHaveBeenSent || beforeSendPassed))
+        (result.requestMayHaveBeenSent || beforeSendPassed.load()))
         return failure(TerminalOperationOutcome::UNKNOWN,
             "ADAPTER_FAILURE_AFTER_SEND", "Adapter failure after send is unresolved", true);
-    if (result.outcome == TerminalOperationOutcome::UNKNOWN && !beforeSendPassed)
+    if (result.outcome == TerminalOperationOutcome::UNKNOWN && !beforeSendPassed.load())
     {
         if (result.requestMayHaveBeenSent)
             return failure(TerminalOperationOutcome::UNKNOWN,
