@@ -55,6 +55,7 @@ struct TerminalOperationResult
     std::string message;
     bool simulated = false;
     bool requestMayHaveBeenSent = false;
+    std::string adapterId;
 
     bool correlatesTo(const TerminalOperationRequest& request) const
     {

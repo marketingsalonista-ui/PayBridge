@@ -92,8 +92,10 @@ PaymentOrchestrationResult PaymentOrchestrationService::process(
     };
 
     bool sentStatePersisted = false;
-    const auto terminalResult = terminals.executeOperation(operation, [&]()
+    const auto terminalResult = terminals.executeOperation(operation,
+        [&](const std::string& adapterId)
     {
+        transaction.adapterId = adapterId;
         sentStatePersisted = engine.updateStatusForRequest(transaction,
             TransactionStatus::SENT, replay.requestId, ReplayState::PROCESSING,
             "SENT", "SIMULATED_REQUEST_SENT",

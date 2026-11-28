@@ -47,6 +47,14 @@ public:
     bool registerAdapter(std::shared_ptr<ITerminalAdapter> adapter);
     bool selectTerminal(const std::string& requestedTerminalId,
         std::string& selectedTerminalId, std::string& error) const;
+    // Receives the ID of the adapter selected (and preflight-checked) for this
+    // operation, so the caller can persist it together with the SENT state.
+    using AdapterAwareBeforeSend = std::function<bool(const std::string& adapterId)>;
+
+    TerminalOperationResult executeOperation(
+        const TerminalOperationRequest& request,
+        const AdapterAwareBeforeSend& beforeSend);
+
     TerminalOperationResult executeOperation(
         const TerminalOperationRequest& request,
         const ITerminalAdapter::BeforeSend& beforeSend);

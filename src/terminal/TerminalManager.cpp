@@ -300,11 +300,22 @@ TerminalOperationResult TerminalManager::executeOperation(
     const TerminalOperationRequest& request,
     const ITerminalAdapter::BeforeSend& beforeSend)
 {
-    auto failure = [&request](TerminalOperationOutcome outcome, const std::string& code,
+    AdapterAwareBeforeSend adapterAware;
+    if (beforeSend)
+        adapterAware = [&beforeSend](const std::string&) { return beforeSend(); };
+    return executeOperation(request, adapterAware);
+}
+
+TerminalOperationResult TerminalManager::executeOperation(
+    const TerminalOperationRequest& request,
+    const AdapterAwareBeforeSend& beforeSend)
+{
+    std::string selectedAdapterId;
+    auto failure = [&request, &selectedAdapterId](TerminalOperationOutcome outcome, const std::string& code,
         const std::string& message, bool mayHaveSent = false)
     {
         return TerminalOperationResult{outcome, request.requestId, request.transactionId,
-            request.externalReference, request.terminalId, code, message, false, mayHaveSent};
+            request.externalReference, request.terminalId, code, message, false, mayHaveSent, selectedAdapterId};
     };
     if (!request.isValid())
         return failure(TerminalOperationOutcome::FAILED, "INVALID_OPERATION", "Operation request is invalid");
@@ -327,7 +338,11 @@ TerminalOperationResult TerminalManager::executeOperation(
         if (!model->second.adapterId.empty())
         {
             const auto found = adapters.find(model->second.adapterId);
-            if (found != adapters.end() && adapterSupports(found->second, model->second)) adapter = found->second;
+            if (found != adapters.end() && adapterSupports(found->second, model->second))
+            {
+                adapter = found->second;
+                selectedAdapterId = found->first;
+            }
         }
         else
         {
@@ -337,6 +352,7 @@ TerminalOperationResult TerminalManager::executeOperation(
                     if (adapter) return failure(TerminalOperationOutcome::FAILED,
                         "ADAPTER_AMBIGUOUS", "Multiple terminal adapters match");
                     adapter = candidate;
+                    selectedAdapterId = id;
                 }
         }
         if (!adapter)
@@ -403,7 +419,7 @@ TerminalOperationResult TerminalManager::executeOperation(
     const ITerminalAdapter::BeforeSend guardedBeforeSend = [&]()
     {
         if (beforeSendAttempted.exchange(true)) return false;
-        if (!beforeSend || !beforeSend()) return false;
+        if (!beforeSend || !beforeSend(selectedAdapterId)) return false;
         beforeSendPassed.store(true);
         return true;
     };
@@ -445,6 +461,7 @@ TerminalOperationResult TerminalManager::executeOperation(
             "ADAPTER_FAILED_BEFORE_SEND",
             "Adapter reported uncertainty before a request was sent");
     }
+    result.adapterId = selectedAdapterId;
     return result;
 }
 
