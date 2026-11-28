@@ -155,6 +155,7 @@ add_executable(TransactionEngineTests
     src/terminal/SimulatedTerminalProtocol.cpp
     src/terminal/SimulatedTerminalPeer.cpp
     src/terminal/SimulatedTerminalAdapter.cpp
+    src/terminal/VerifoneVx680SimulatorAdapter.cpp
     src/terminal/Vx680UnverifiedAdapter.cpp
 )
 
@@ -255,6 +256,7 @@ add_executable(TcpServerLifecycleTests
     src/terminal/SimulatedTerminalProtocol.cpp
     src/terminal/SimulatedTerminalPeer.cpp
     src/terminal/SimulatedTerminalAdapter.cpp
+    src/terminal/VerifoneVx680SimulatorAdapter.cpp
     src/terminal/Vx680UnverifiedAdapter.cpp
 )
 
