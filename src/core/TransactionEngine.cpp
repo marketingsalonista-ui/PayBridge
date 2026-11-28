@@ -550,6 +550,7 @@ bool TransactionEngine::updateStatusForRequest(Transaction& transaction, Transac
     auto it=transactionsByReference.find(transaction.externalReference);
     if(it==transactionsByReference.end() || it->second.transactionId!=transaction.transactionId || it->second.status!=transaction.status || !isValidTransition(it->second.status,newStatus)) return false;
     Transaction updated=it->second; updated.status=newStatus;
+    if(!transaction.adapterId.empty()) updated.adapterId=transaction.adapterId;
     if(!repository->updateTransactionStatusForRequest(updated,it->second.status,requestId,replayState,responseStatus,adapterResultCode,adapterMessage,unknownReason)) { persistenceErrorMessage=repository->getLastError(); return false; }
     it->second=updated; transaction=updated; return true;
 }

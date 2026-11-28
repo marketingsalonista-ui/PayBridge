@@ -176,6 +176,7 @@ nlohmann::json transactionDto(const TransactionReadRecord& record)
                    {"precision", record.asset.decimalPrecision}}}
     };
     if (!record.terminalId.empty()) dto["terminal_id"] = record.terminalId;
+    if (!record.adapterId.empty()) dto["adapter_id"] = record.adapterId;
     return dto;
 }
 }
