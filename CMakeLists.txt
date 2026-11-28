@@ -199,6 +199,8 @@ add_test(NAME TerminalAdapterTests COMMAND TerminalAdapterTests)
 
 add_executable(DashboardApiServerTests
     tests/DashboardApiServerTests.cpp
+    src/core/PaymentOrchestrationService.cpp
+    src/protocol/JsonHandler.cpp
     src/communication/DashboardApiServer.cpp
     src/core/TransactionEngine.cpp
     src/core/TransactionLogger.cpp

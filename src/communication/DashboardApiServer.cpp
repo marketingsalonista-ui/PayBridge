@@ -4,6 +4,8 @@
 #include "../core/TransactionEngine.h"
 #include "../security/AuthManager.h"
 #include "../terminal/TerminalManager.h"
+#include "../core/PaymentOrchestrationService.h"
+#include "../protocol/JsonHandler.h"
 
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
@@ -352,7 +354,8 @@ private:
         const bool detailRoute = path.rfind(DETAIL_PREFIX, 0) == 0;
         const bool terminalsRoute = path == "/api/v1/terminals";
         const bool assetsRoute = path == "/api/v1/assets";
-        if (!listRoute && !detailRoute && !terminalsRoute && !assetsRoute)
+        const bool paymentsRoute = path == "/api/v1/simulator/payments";
+        if (!listRoute && !detailRoute && !terminalsRoute && !assetsRoute && !paymentsRoute)
             return errorResponse(http::status::not_found, request.version(),
                 "NOT_FOUND", "Endpoint not found");
 
@@ -374,6 +377,8 @@ private:
         if (verification != AuthManager::VerificationResult::ALLOWED)
             return errorResponse(http::status::service_unavailable, request.version(),
                 "AUTH_UNAVAILABLE", "Authentication service is unavailable");
+        if (paymentsRoute)
+            return handleSimulatorPayment(request, query);
 
         if (request.method() != http::verb::get)
             return errorResponse(http::status::method_not_allowed, request.version(),
@@ -460,6 +465,73 @@ private:
                     {"precision", asset.precision}, {"enabled", asset.enabled}
                 });
         return jsonResponse(http::status::ok, request.version(), {{"assets", values}});
+    }
+
+    // POST /api/v1/simulator/payments. Reached only after Bearer verification.
+    // Simulator-only: the terminal must resolve through selectSimulatedTerminal
+    // before the orchestration service is called, so no other adapter is
+    // reachable from here. Adapter preflight is untouched.
+    // Note: this runs synchronously on an HTTP worker thread, which is
+    // acceptable for simulated terminals only.
+    HttpResponse handleSimulatorPayment(const HttpRequest& request, const std::string& query) const
+    {
+        const unsigned version = request.version();
+        if (request.method() != http::verb::post)
+            return errorResponse(http::status::method_not_allowed, version,
+                "METHOD_NOT_ALLOWED", "Only POST is supported");
+        if (!query.empty())
+            return errorResponse(http::status::bad_request, version,
+                "INVALID_QUERY", "Endpoint does not accept query parameters");
+        if (!paymentService || !transactionEngine || !terminalManager ||
+            !transactionEngine->isReady())
+            return errorResponse(http::status::service_unavailable, version,
+                "PAYMENTS_UNAVAILABLE", "Simulated payments are unavailable");
+
+        const std::string contentType(request[http::field::content_type]);
+        if (contentType != "application/json" && contentType.rfind("application/json;", 0) != 0)
+            return errorResponse(http::status::unsupported_media_type, version,
+                "UNSUPPORTED_MEDIA_TYPE", "Content-Type must be application/json");
+        if (request.body().empty())
+            return errorResponse(http::status::bad_request, version,
+                "INVALID_BODY", "A JSON request body is required");
+
+        const PaymentValidation validation = JsonHandler::parseAndValidatePaymentRequest(
+            request.body(), transactionEngine->assets());
+        if (!validation.valid)
+            return errorResponse(http::status::bad_request, version,
+                validation.errorCode, validation.message);
+
+        std::string terminalId, selectionError;
+        if (!terminalManager->selectSimulatedTerminal(
+                validation.request.terminalId, terminalId, selectionError))
+            return errorResponse(http::status::unprocessable_entity, version,
+                "TERMINAL_UNAVAILABLE", "No matching simulated terminal is available");
+
+        const PaymentOrchestrationResult result =
+            paymentService->process(validation.request, terminalId);
+
+        if (result.status == "REJECTED")
+        {
+            const bool conflict = result.errorCode == "REPLAY_CONFLICT" ||
+                result.errorCode == "EXTERNAL_REFERENCE_CONFLICT";
+            return errorResponse(
+                conflict ? http::status::conflict : http::status::service_unavailable, version,
+                result.errorCode.empty() ? "PERSISTENCE_FAILURE" : result.errorCode,
+                result.message);
+        }
+
+        nlohmann::json body = {
+            {"request_id", validation.request.envelope.requestId},
+            {"status", result.status},
+            {"message", result.message},
+            {"simulated", result.simulated}
+        };
+        if (!result.transactionId.empty()) body["transaction_id"] = result.transactionId;
+        if (!result.terminalId.empty()) body["terminal_id"] = result.terminalId;
+        if (!result.resultCode.empty()) body["result_code"] = result.resultCode;
+        return jsonResponse(result.status == "PROCESSING" ? http::status::accepted
+                                                          : http::status::ok,
+            version, body);
     }
 
     class Session : public std::enable_shared_from_this<Session>
