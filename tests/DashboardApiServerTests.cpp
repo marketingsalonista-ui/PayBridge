@@ -3,6 +3,9 @@
 #include "../src/security/AuthManager.h"
 #include "../src/terminal/SimulatedTerminalTransport.h"
 #include "../src/terminal/TerminalManager.h"
+#include "../src/terminal/SimulatedTerminalAdapter.h"
+#include "../src/core/PaymentOrchestrationService.h"
+#include "../src/protocol/JsonHandler.h"
 
 #include <winsock2.h>
 
@@ -11,7 +14,12 @@
 #include <nlohmann/json.hpp>
 #include <sqlite3.h>
 
+#include <atomic>
 #include <cassert>
+#include <cstdlib>
+#include <memory>
+#include <utility>
+#include <vector>
 #include <chrono>
 #include <filesystem>
 #include <iostream>
@@ -65,6 +73,24 @@ nlohmann::json parsed(const HttpResult& result)
 {
     return nlohmann::json::parse(result.body);
 }
+
+// Counts send attempts so replay tests can prove a retry never reaches the terminal.
+class PostRouteCountingTransport final : public paybridge::terminal::SimulatedTerminalTransport
+{
+public:
+    PostRouteCountingTransport(paybridge::terminal::SimulatedTerminalOutcome outcome,
+        std::shared_ptr<std::atomic<int>> counter)
+        : SimulatedTerminalTransport(outcome), sends(std::move(counter)) {}
+
+    paybridge::transport::TransportResult send(const std::vector<std::uint8_t>& bytes) override
+    {
+        ++*sends;
+        return SimulatedTerminalTransport::send(bytes);
+    }
+
+private:
+    std::shared_ptr<std::atomic<int>> sends;
+};
 
 int main()
 {
@@ -270,6 +296,237 @@ int main()
     limitedServer.stop();
     limitedServer.join();
     assert(!limitedServer.isRunning());
+
+    // ---- POST /api/v1/simulator/payments ----
+    {
+        namespace term = paybridge::terminal;
+        const auto fail = [](const std::string& what)
+        {
+            std::cerr << "POST-ROUTE TEST FAILED: " << what << std::endl;
+            std::exit(1);
+        };
+        const auto expect = [&fail](bool condition, const std::string& what)
+        {
+            if (!condition) fail(what);
+        };
+
+        const auto payRoot = root / "payments";
+        std::filesystem::create_directories(payRoot);
+        const std::string payDb = (payRoot / "payments.sqlite").string();
+        std::vector<std::pair<std::string, std::string>> recorded;  // transaction id, expected status
+        const std::string payToken(64, 'b');
+        const std::string payBearer = "Bearer " + payToken;
+
+        {
+            TransactionEngine payEngine(payDb, {});
+            expect(payEngine.initialize(), "payment test engine failed to initialize");
+
+            term::TerminalManager payTerminals;
+            expect(payTerminals.registerAdapter(std::make_shared<term::SimulatedTerminalAdapter>()),
+                "could not register simulated adapter");
+            auto approveSends = std::make_shared<std::atomic<int>>(0);
+            const auto addSimulated = [&](const std::string& id,
+                std::unique_ptr<paybridge::transport::ITransport> transport)
+            {
+                term::TerminalModel model;
+                model.terminalId = id;
+                model.transportKind = term::TransportKind::SIMULATED;
+                expect(payTerminals.registerTerminal(model), "could not register " + id);
+                payTerminals.setTransport(id, std::move(transport));
+            };
+            addSimulated("SIM-APPROVE", std::make_unique<PostRouteCountingTransport>(
+                term::SimulatedTerminalOutcome::APPROVED, approveSends));
+            addSimulated("SIM-DECLINE", std::make_unique<term::SimulatedTerminalTransport>(
+                term::SimulatedTerminalOutcome::DECLINED));
+            addSimulated("SIM-TIMEOUT", std::make_unique<term::SimulatedTerminalTransport>(
+                term::SimulatedTerminalOutcome::TIMEOUT));
+            addSimulated("SIM-DISCONNECT", std::make_unique<term::SimulatedTerminalTransport>(
+                term::SimulatedTerminalOutcome::DISCONNECTED));
+            term::TerminalModel tcpModel;
+            tcpModel.terminalId = "TCP-NOT-SIM";
+            tcpModel.transportKind = term::TransportKind::TCP;
+            expect(payTerminals.registerTerminal(tcpModel), "could not register TCP terminal");
+
+            PaymentOrchestrationService payService(payEngine, payTerminals);
+            const AuthManager payAuth = AuthManager::fromBearerToken(payToken);
+            DashboardApiServer::Config payConfig;
+            payConfig.port = 0;
+            DashboardApiServer payServer(payConfig, payAuth, payEngine, payTerminals,
+                payEngine.assets(), payService);
+            expect(payServer.start(), "payment test server failed to start");
+            const std::uint16_t port = payServer.boundPort();
+
+            const auto post = [port](const std::optional<std::string>& authorization,
+                const std::string& contentType, const std::string& body)
+            {
+                asio::io_context context;
+                tcp::socket socket(context);
+                socket.connect({asio::ip::make_address_v4("127.0.0.1"), port});
+                http::request<http::string_body> request{
+                    http::verb::post, "/api/v1/simulator/payments", 11};
+                request.set(http::field::host, "127.0.0.1");
+                if (authorization) request.set(http::field::authorization, *authorization);
+                if (!contentType.empty()) request.set(http::field::content_type, contentType);
+                request.body() = body;
+                request.prepare_payload();
+                http::write(socket, request);
+                beast::flat_buffer buffer;
+                http::response<http::string_body> response;
+                http::read(socket, buffer, response);
+                return HttpResult{response.result_int(), response.body()};
+            };
+            const auto nowSeconds = []() -> std::int64_t
+            {
+                return std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
+            };
+            const auto makeBody = [](const std::string& requestId, const std::string& reference,
+                const std::string& amount, const std::string& terminal, std::int64_t timestamp)
+            {
+                nlohmann::json body = {
+                    {"protocol_version", "1.0"}, {"message_type", "PAYMENT_REQUEST"},
+                    {"external_reference", reference}, {"request_id", requestId},
+                    {"request_timestamp", timestamp}, {"request_expiry", timestamp + 300},
+                    {"payment", {{"amount", amount},
+                        {"asset", {{"type", "FIAT"}, {"code", "USD"}}}}}
+                };
+                if (!terminal.empty()) body["terminal_id"] = terminal;
+                return body.dump();
+            };
+            const auto transactionCount = [&]() -> std::size_t
+            {
+                const auto listed = sendRequest(port, "/api/v1/transactions?limit=100", payBearer);
+                expect(listed.status == 200, "transaction list failed: " + listed.body);
+                return nlohmann::json::parse(listed.body).at("transactions").size();
+            };
+            const auto errorCodeOf = [](const HttpResult& result) -> std::string
+            {
+                try { return nlohmann::json::parse(result.body).at("error").at("code").get<std::string>(); }
+                catch (...) { return "<unparseable>"; }
+            };
+            int referenceNumber = 0;
+            const auto nextReference = [&referenceNumber]()
+            {
+                return "POST-ROUTE-PRIVATE-REF-" + std::to_string(++referenceNumber);
+            };
+
+            const auto runScenario = [&](const std::string& terminal,
+                const std::string& expectedStatus, const std::string& expectedResultCode)
+            {
+                const std::string reference = nextReference();
+                const auto response = post(payBearer, "application/json",
+                    makeBody(JsonHandler::generateRequestId(), reference, "12.34", terminal, nowSeconds()));
+                const std::string label = terminal + " expected " + expectedStatus +
+                    " but got HTTP " + std::to_string(response.status) + " " + response.body;
+                expect(response.status == 200, label);
+                const auto json = nlohmann::json::parse(response.body);
+                expect(json.value("status", "") == expectedStatus, label);
+                expect(json.value("result_code", "") == expectedResultCode, label);
+                expect(json.value("simulated", false), terminal + " response must be marked simulated");
+                expect(response.body.find(reference) == std::string::npos,
+                    "external_reference leaked in response for " + terminal);
+                expect(response.body.find(payToken) == std::string::npos, "token leaked in response");
+                const std::string id = json.value("transaction_id", "");
+                expect(!id.empty(), "no transaction_id for " + terminal);
+                const auto stored = sendRequest(port, "/api/v1/transactions/" + id, payBearer);
+                expect(stored.status == 200, "GET detail failed for " + terminal + ": " + stored.body);
+                expect(nlohmann::json::parse(stored.body).value("status", "") == expectedStatus,
+                    "persisted status mismatch for " + terminal + ": " + stored.body);
+                recorded.emplace_back(id, expectedStatus);
+            };
+
+            // Terminal outcomes.
+            runScenario("SIM-APPROVE", "APPROVED", "SIMULATED_APPROVED");
+            runScenario("SIM-DECLINE", "DECLINED", "SIMULATED_DECLINED");
+            runScenario("SIM-TIMEOUT", "UNKNOWN", "SIMULATED_RESPONSE_HEADER_INCOMPLETE");
+            runScenario("SIM-DISCONNECT", "FAILED", "TERMINAL_CONNECT_FAILED");
+
+            // Terminal selection is simulator-only and creates no transaction.
+            const std::size_t beforeSelection = transactionCount();
+            for (const std::string& terminal : {std::string("SIM-NOPE"), std::string("TCP-NOT-SIM"), std::string()})
+            {
+                const auto response = post(payBearer, "application/json",
+                    makeBody(JsonHandler::generateRequestId(), nextReference(), "1.00", terminal, nowSeconds()));
+                expect(response.status == 422 && errorCodeOf(response) == "TERMINAL_UNAVAILABLE",
+                    "terminal '" + terminal + "' should return 422 TERMINAL_UNAVAILABLE, got " +
+                    std::to_string(response.status) + " " + response.body);
+            }
+            expect(transactionCount() == beforeSelection, "terminal-selection failures created transactions");
+
+            // Authentication happens before anything else and creates nothing.
+            const std::size_t beforeAuth = transactionCount();
+            const std::string validBody = makeBody(JsonHandler::generateRequestId(), nextReference(),
+                "5.00", "SIM-APPROVE", nowSeconds());
+            expect(post(std::nullopt, "application/json", validBody).status == 401, "missing auth must be 401");
+            expect(post(std::string("Basic abc"), "application/json", validBody).status == 401, "Basic auth must be 401");
+            expect(post(std::string("Bearer malformed"), "application/json", validBody).status == 401, "malformed Bearer must be 401");
+            expect(post("Bearer " + std::string(64, 'c'), "application/json", validBody).status == 401, "wrong token must be 401");
+            expect(sendRequest(port, "/api/v1/simulator/payments").status == 401, "unauthenticated GET must be 401");
+            expect(transactionCount() == beforeAuth, "rejected requests created transactions");
+
+            // Request validation.
+            expect(sendRequest(port, "/api/v1/simulator/payments", payBearer).status == 405, "GET with auth must be 405");
+            expect(post(payBearer, "text/plain", validBody).status == 415, "text/plain must be 415");
+            expect(post(payBearer, "", validBody).status == 415, "missing content type must be 415");
+            const auto badJson = post(payBearer, "application/json", "{not json");
+            expect(badJson.status == 400 && errorCodeOf(badJson) == "INVALID_JSON",
+                "malformed JSON should be 400 INVALID_JSON, got " + badJson.body);
+            const auto stale = post(payBearer, "application/json", makeBody(JsonHandler::generateRequestId(),
+                nextReference(), "5.00", "SIM-APPROVE", nowSeconds() - 1000));
+            expect(stale.status == 400 && errorCodeOf(stale) == "REQUEST_TIMESTAMP_INVALID",
+                "stale timestamp should be 400 REQUEST_TIMESTAMP_INVALID, got " + stale.body);
+            const auto withQuery = sendRequest(port, "/api/v1/simulator/payments?x=1", payBearer,
+                http::verb::post, validBody);
+            expect(withQuery.status == 400 && errorCodeOf(withQuery) == "INVALID_QUERY",
+                "query string should be 400 INVALID_QUERY, got " + withQuery.body);
+            expect(transactionCount() == beforeAuth, "invalid requests created transactions");
+
+            // Replay: identical retry returns the stored result without a second send.
+            const std::string replayId = JsonHandler::generateRequestId();
+            const std::string replayReference = nextReference();
+            const std::string replayBody = makeBody(replayId, replayReference, "7.00", "SIM-APPROVE", nowSeconds());
+            const int sendsBefore = approveSends->load();
+            const auto firstReplay = post(payBearer, "application/json", replayBody);
+            const auto secondReplay = post(payBearer, "application/json", replayBody);
+            expect(firstReplay.status == 200 && secondReplay.status == 200,
+                "replay calls should both be 200: " + firstReplay.body + " / " + secondReplay.body);
+            const auto firstJson = nlohmann::json::parse(firstReplay.body);
+            const auto secondJson = nlohmann::json::parse(secondReplay.body);
+            expect(firstJson.value("status", "") == "APPROVED" && secondJson.value("status", "") == "APPROVED",
+                "replay statuses should be APPROVED: " + secondReplay.body);
+            expect(firstJson.value("transaction_id", "a") == secondJson.value("transaction_id", "b"),
+                "identical retry must return the same transaction");
+            expect(approveSends->load() - sendsBefore == 1, "identical retry must not reach the terminal again");
+            recorded.emplace_back(firstJson.value("transaction_id", ""), "APPROVED");
+
+            // Replay: same request_id with a changed payment is a conflict.
+            const auto conflict = post(payBearer, "application/json",
+                makeBody(replayId, replayReference, "99.99", "SIM-APPROVE", nowSeconds()));
+            const std::string conflictCode = errorCodeOf(conflict);
+            expect(conflict.status == 409 &&
+                    (conflictCode == "REPLAY_CONFLICT" || conflictCode == "EXTERNAL_REFERENCE_CONFLICT"),
+                "changed payment under same request_id should be 409, got " +
+                std::to_string(conflict.status) + " " + conflict.body);
+            expect(approveSends->load() - sendsBefore == 1, "conflicting replay must not reach the terminal");
+
+            payServer.stop();
+            payServer.join();
+            expect(!payServer.isRunning(), "payment test server did not stop");
+        }
+
+        // Durable persistence: reopen the same database file in a new engine.
+        TransactionEngine reopened(payDb, {});
+        expect(reopened.initialize(), "reopened engine failed to initialize");
+        for (const auto& [id, status] : recorded)
+        {
+            const auto record = reopened.findTransactionById(id);
+            expect(record.has_value(), "transaction missing after reopen: " + id);
+            expect(TransactionEngine::statusToString(record->status) == status,
+                "status changed after reopen for " + id + ": expected " + status);
+        }
+        std::cout << "Simulator payment route tests passed ("
+                  << recorded.size() << " transactions verified after reopen)\n";
+    }
 
     std::error_code ignored;
     std::filesystem::remove_all(root, ignored);
