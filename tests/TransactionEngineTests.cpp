@@ -1759,7 +1759,7 @@ int main()
             "SELECT metadata_value FROM schema_metadata WHERE metadata_key='schema_version'",
             -1, &version, nullptr) == SQLITE_OK);
         assert(sqlite3_step(version) == SQLITE_ROW);
-        assert(std::string(reinterpret_cast<const char*>(sqlite3_column_text(version, 0))) == "2");
+        assert(std::string(reinterpret_cast<const char*>(sqlite3_column_text(version, 0))) == "3");
         sqlite3_finalize(version);
         sqlite3_close(db);
     }
