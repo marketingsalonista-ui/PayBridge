@@ -191,13 +191,13 @@ function TransactionTable({
   onSelect: (transactionId: string) => void
 }) {
   return <div className="overflow-x-auto"><table className="data-table">
-    <thead><tr><th>Transaction</th><th>Asset</th><th>Amount</th><th>Status</th><th>Terminal</th><th>Created</th></tr></thead>
+    <thead><tr><th>Transaction</th><th>Asset</th><th>Amount</th><th>Status</th><th>Terminal</th><th>Adapter</th><th>Created</th></tr></thead>
     <tbody>{transactions.map((transaction) => <tr key={transaction.transaction_id}>
       <td><button className="font-medium text-indigo-600 hover:underline dark:text-indigo-300" onClick={() => onSelect(transaction.transaction_id)}>{transaction.transaction_id}</button></td>
       <td>{transaction.asset.code}</td>
       <td className="whitespace-nowrap font-medium">{formatAmount(transaction.amount.units, transaction.amount.precision, transaction.asset.code)}</td>
       <td><StatusBadge status={transaction.status}/></td>
-      <td>{transaction.terminal_id ?? '—'}</td>
+      <td>{transaction.terminal_id ?? '—'}</td><td className="break-all text-xs">{transaction.adapter_id ?? '—'}</td>
       <td className="whitespace-nowrap">{formatTimestamp(transaction.created_at_unix)}</td>
     </tr>)}</tbody>
   </table></div>
@@ -223,6 +223,7 @@ function TransactionDetailPanel({
       {detail.data && <dl className="mt-6 grid grid-cols-2 gap-4 text-sm">
         <div><dt className="text-xs text-slate-400">Status</dt><dd className="mt-1"><StatusBadge status={detail.data.status}/></dd></div>
         <div><dt className="text-xs text-slate-400">Terminal</dt><dd className="mt-1">{detail.data.terminal_id ?? '—'}</dd></div>
+        <div><dt className="text-xs text-slate-400">Adapter</dt><dd className="mt-1 break-all">{detail.data.adapter_id ?? '—'}</dd></div>
         <div><dt className="text-xs text-slate-400">Amount</dt><dd className="mt-1 font-medium">{formatAmount(detail.data.amount.units, detail.data.amount.precision, detail.data.asset.code)}</dd></div>
         <div><dt className="text-xs text-slate-400">Asset type</dt><dd className="mt-1">{detail.data.asset.type}</dd></div>
         <div><dt className="text-xs text-slate-400">Created</dt><dd className="mt-1">{formatTimestamp(detail.data.created_at_unix)}</dd></div>
@@ -289,7 +290,7 @@ function App() {
   const visibleTransactions = (transactionsResource.data?.transactions ?? []).filter((transaction) => {
     const normalized = search.trim().toLowerCase()
     if (!normalized) return true
-    return [transaction.transaction_id, transaction.asset.code, transaction.terminal_id ?? '', transaction.status]
+    return [transaction.transaction_id, transaction.asset.code, transaction.terminal_id ?? '', transaction.adapter_id ?? '', transaction.status]
       .some((value) => value.toLowerCase().includes(normalized))
   })
 

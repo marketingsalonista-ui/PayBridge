@@ -35,6 +35,7 @@ export interface TransactionDto {
     precision: number
   }
   terminal_id?: string
+  adapter_id?: string
 }
 
 export interface TransactionsResponse {
