@@ -212,6 +212,53 @@ bool TerminalManager::registerAdapter(std::shared_ptr<ITerminalAdapter> adapter)
     return true;
 }
 
+std::vector<AdapterReadModel> TerminalManager::adapterSnapshots() const
+{
+    std::vector<std::pair<std::string, std::shared_ptr<ITerminalAdapter>>> registered;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        registered.reserve(adapters.size());
+
+        for (const auto& [id, adapter] : adapters)
+            registered.emplace_back(id, adapter);
+    }
+
+    std::vector<AdapterReadModel> result;
+    result.reserve(registered.size());
+
+    for (const auto& [id, adapter] : registered)
+    {
+        AdapterMetadata metadata{
+            id,
+            "Unknown",
+            "Unknown",
+            "UNSPECIFIED",
+            "UNVERIFIED",
+            "Adapter metadata could not be retrieved"
+        };
+
+        try
+        {
+            if (adapter)
+                metadata = adapter->metadata();
+        }
+        catch (...)
+        {
+            // Retain safe fallback metadata.
+        }
+
+        result.push_back({id, std::move(metadata)});
+    }
+
+    std::sort(result.begin(), result.end(),
+        [](const auto& left, const auto& right)
+        {
+            return left.adapterId < right.adapterId;
+        });
+
+    return result;
+}
 bool TerminalManager::selectTerminal(const std::string& requestedTerminalId,
     std::string& selectedTerminalId, std::string& error) const
 {

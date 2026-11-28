@@ -354,8 +354,9 @@ private:
         const bool detailRoute = path.rfind(DETAIL_PREFIX, 0) == 0;
         const bool terminalsRoute = path == "/api/v1/terminals";
         const bool assetsRoute = path == "/api/v1/assets";
+        const bool adaptersRoute = path == "/api/v1/adapters";
         const bool paymentsRoute = path == "/api/v1/simulator/payments";
-        if (!listRoute && !detailRoute && !terminalsRoute && !assetsRoute && !paymentsRoute)
+        if (!listRoute && !detailRoute && !terminalsRoute && !assetsRoute && !adaptersRoute && !paymentsRoute)
             return errorResponse(http::status::not_found, request.version(),
                 "NOT_FOUND", "Endpoint not found");
 
@@ -455,6 +456,30 @@ private:
                         {"available", terminal.available}
                     });
             return jsonResponse(http::status::ok, request.version(), {{"terminals", values}});
+        }
+
+        if (adaptersRoute)
+        {
+            nlohmann::json values = nlohmann::json::array();
+
+            if (terminalManager)
+            {
+                for (const auto& adapter : terminalManager->adapterSnapshots())
+                {
+                    values.push_back({
+                        {"adapter_id", adapter.adapterId},
+                        {"display_name", adapter.metadata.displayName},
+                        {"manufacturer", adapter.metadata.manufacturer},
+                        {"device_model", adapter.metadata.deviceModel},
+                        {"execution_scope", adapter.metadata.executionScope},
+                        {"verification_status", adapter.metadata.verificationStatus},
+                        {"description", adapter.metadata.description}
+                    });
+                }
+            }
+
+            return jsonResponse(http::status::ok, request.version(),
+                {{"adapters", std::move(values)}});
         }
 
         nlohmann::json values = nlohmann::json::array();

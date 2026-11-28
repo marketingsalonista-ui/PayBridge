@@ -18,6 +18,17 @@ TerminalOperationResult resultFor(const TerminalOperationRequest& request,
 }
 
 std::string SimulatedTerminalAdapter::adapterId() const { return ID; }
+AdapterMetadata SimulatedTerminalAdapter::metadata() const
+{
+    return {
+        "PayBridge Simulator",
+        "PayBridge",
+        "Simulated Terminal",
+        "SIMULATION_ONLY",
+        "SIMULATED",
+        "PayBridge framed simulator; does not communicate with physical payment terminals."
+    };
+}
 
 bool SimulatedTerminalAdapter::supports(const TerminalModel& terminal) const
 {

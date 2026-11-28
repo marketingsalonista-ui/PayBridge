@@ -13,6 +13,12 @@
 namespace paybridge::terminal
 {
 
+struct AdapterReadModel
+{
+    std::string adapterId;
+    AdapterMetadata metadata;
+};
+
 struct TerminalReadModel
 {
     std::string terminalId;
@@ -33,6 +39,7 @@ public:
     bool containsTerminal(const std::string& terminalId) const;
     std::vector<TerminalModel> terminals() const;
     std::vector<TerminalReadModel> terminalSnapshots() const;
+    std::vector<AdapterReadModel> adapterSnapshots() const;
     bool selectSimulatedTerminal(
         const std::string& requestedTerminalId,
         std::string& selectedTerminalId,

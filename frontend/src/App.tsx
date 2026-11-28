@@ -21,6 +21,7 @@ import {
   PayBridgeApiError,
 } from './services/api'
 import type {
+  AdapterDto,
   AssetDto,
   HealthResponse,
   TransactionDto,
@@ -258,6 +259,8 @@ function App() {
   const terminalsResource = useApiResource(terminalLoader, 15_000)
   const assetLoader = useCallback((signal: AbortSignal) => payBridgeApi.getAssets(signal), [])
   const assetsResource = useApiResource(assetLoader, null)
+  const adapterLoader = useCallback((signal: AbortSignal) => payBridgeApi.getAdapters(signal), [])
+  const adaptersResource = useApiResource(adapterLoader, null)
   const healthLoader = useCallback((signal: AbortSignal) => payBridgeApi.getHealth(signal), [])
   const healthResource = useApiResource<HealthResponse>(healthLoader, 30_000)
 
@@ -268,7 +271,8 @@ function App() {
 
   const mostRecentRefresh = useMemo(() => {
     const times = [transactionsResource.lastUpdated, terminalsResource.lastUpdated,
-      assetsResource.lastUpdated, healthResource.lastUpdated].filter((value): value is Date => value !== null)
+      assetsResource.lastUpdated, adaptersResource.lastUpdated,
+      healthResource.lastUpdated].filter((value): value is Date => value !== null)
     return times.length ? new Date(Math.max(...times.map((value) => value.getTime()))) : null
   }, [transactionsResource.lastUpdated, terminalsResource.lastUpdated, assetsResource.lastUpdated, healthResource.lastUpdated])
 
@@ -373,6 +377,42 @@ function App() {
         <ResourceStateMessage resource={assetsResource} label="asset registry" onRetry={assetsResource.retry}/>
         {assetsResource.data && assets.length === 0 && <p className="p-10 text-center text-sm text-slate-500">No assets are configured.</p>}
         {assets.length > 0 && <div className="overflow-x-auto"><table className="data-table"><thead><tr><th>Asset</th><th>Type</th><th>Precision</th><th>Enabled</th></tr></thead><tbody>{assets.map((asset: AssetDto) => <tr key={`${asset.type}:${asset.code}:${asset.precision}`}><td className="font-semibold">{asset.code}</td><td>{asset.type}</td><td>{asset.precision} decimals</td><td>{asset.enabled ? 'Enabled' : 'Disabled'}</td></tr>)}</tbody></table></div>}
+      </section>
+    }
+
+    if (active === 'Adapters') {
+      const adapters = adaptersResource.data?.adapters ?? []
+      return <section className="panel overflow-hidden">
+        <div className="flex flex-wrap items-end justify-between gap-3 px-5 py-5">
+          <div>
+            <p className="eyebrow">READ-ONLY REGISTRY · SIMULATION ENVIRONMENT</p>
+            <h1 className="mt-1 text-xl font-semibold">Terminal adapters</h1>
+            <p className="mt-1 text-sm text-slate-400">Registered adapter metadata and verification boundaries.</p>
+          </div>
+          <span className="text-xs text-slate-400">Last successful refresh: {formatRefresh(adaptersResource.lastUpdated)}</span>
+        </div>
+        <ResourceStateMessage resource={adaptersResource} label="adapter registry" onRetry={adaptersResource.retry}/>
+        {adaptersResource.data && adapters.length === 0 && <p className="p-10 text-center text-sm text-slate-500">No adapters are registered.</p>}
+        {adapters.length > 0 && <div className="grid gap-4 p-5 md:grid-cols-2 xl:grid-cols-3">
+          {adapters.map((adapter: AdapterDto) => {
+            const simulated = adapter.verification_status === 'SIMULATED'
+            return <article key={adapter.adapter_id} className="rounded-xl border border-slate-200 p-5 dark:border-slate-700/70">
+              <div className="flex flex-wrap items-start justify-between gap-2">
+                <h2 className="text-sm font-semibold text-slate-900 dark:text-white">{adapter.display_name}</h2>
+                <span className={`rounded-full px-2.5 py-1 text-[10px] font-semibold ${
+                  simulated
+                    ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/60 dark:text-emerald-300'
+                    : 'bg-amber-100 text-amber-800 dark:bg-amber-950/60 dark:text-amber-300'
+                }`}>{adapter.verification_status}</span>
+              </div>
+              <p className="mt-2 text-xs text-slate-400">{adapter.manufacturer} · {adapter.device_model}</p>
+              <p className="mt-4 text-[10px] font-semibold uppercase tracking-wider text-slate-400">Execution scope</p>
+              <p className="mt-1 text-xs font-medium text-slate-700 dark:text-slate-200">{adapter.execution_scope}</p>
+              <p className="mt-3 break-all text-[10px] text-slate-500">{adapter.adapter_id}</p>
+              <p className="mt-4 text-xs leading-5 text-slate-500 dark:text-slate-400">{adapter.description}</p>
+            </article>
+          })}
+        </div>}
       </section>
     }
 

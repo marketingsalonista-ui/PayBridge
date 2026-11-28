@@ -8,6 +8,18 @@ std::string Vx680UnverifiedAdapter::adapterId() const
     return ID;
 }
 
+AdapterMetadata Vx680UnverifiedAdapter::metadata() const
+{
+    return {
+        "Verifone VX 680 (Unverified)",
+        "Verifone",
+        "VX 680",
+        "BLOCKED_UNTIL_VERIFIED",
+        "UNVERIFIED",
+        "Real ECR protocol is unverified; preflight blocks connection and no request bytes are sent."
+    };
+}
+
 bool Vx680UnverifiedAdapter::supports(const TerminalModel& terminal) const
 {
     const bool idMatches = terminal.adapterId.empty() || terminal.adapterId == ID;

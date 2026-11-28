@@ -15,6 +15,7 @@ public:
     static constexpr const char* ID = "paybridge.verifone.vx680.unverified";
 
     std::string adapterId() const override;
+    AdapterMetadata metadata() const override;
     bool supports(const TerminalModel& terminal) const override;
     AdapterPreflightResult preflight(
         const TerminalModel& terminal,

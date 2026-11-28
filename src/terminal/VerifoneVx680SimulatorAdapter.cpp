@@ -40,6 +40,18 @@ std::string VerifoneVx680SimulatorAdapter::adapterId() const
     return ID;
 }
 
+AdapterMetadata VerifoneVx680SimulatorAdapter::metadata() const
+{
+    return {
+        "Verifone VX 680 Simulator",
+        "Verifone",
+        "VX 680",
+        "SIMULATION_PROFILE_ONLY",
+        "SIMULATED",
+        "Uses the PayBridge simulator through a simulated transport; not a physical VX 680 integration."
+    };
+}
+
 bool VerifoneVx680SimulatorAdapter::supports(
     const TerminalModel& terminal) const
 {

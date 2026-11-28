@@ -12,6 +12,7 @@ public:
         "paybridge.verifone.vx680.simulator.v1";
 
     std::string adapterId() const override;
+    AdapterMetadata metadata() const override;
     bool supports(const TerminalModel& terminal) const override;
     AdapterPreflightResult preflight(
         const TerminalModel& terminal,

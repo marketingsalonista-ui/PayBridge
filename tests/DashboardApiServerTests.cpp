@@ -4,6 +4,8 @@
 #include "../src/terminal/SimulatedTerminalTransport.h"
 #include "../src/terminal/TerminalManager.h"
 #include "../src/terminal/SimulatedTerminalAdapter.h"
+#include "../src/terminal/VerifoneVx680SimulatorAdapter.h"
+#include "../src/terminal/Vx680UnverifiedAdapter.h"
 #include "../src/core/PaymentOrchestrationService.h"
 #include "../src/protocol/JsonHandler.h"
 
@@ -117,6 +119,12 @@ int main()
     assert(engine.assets().registerUsdt("PRIVATE-NETWORK", "PRIVATE-CONTRACT-DETAIL", 6));
 
     paybridge::terminal::TerminalManager terminals;
+    assert(terminals.registerAdapter(
+        std::make_shared<paybridge::terminal::SimulatedTerminalAdapter>()));
+    assert(terminals.registerAdapter(
+        std::make_shared<paybridge::terminal::VerifoneVx680SimulatorAdapter>()));
+    assert(terminals.registerAdapter(
+        std::make_shared<paybridge::terminal::Vx680UnverifiedAdapter>()));
     paybridge::terminal::TerminalModel terminal;
     terminal.terminalId = "SIM-API-001";
     terminal.transportKind = paybridge::terminal::TransportKind::SIMULATED;
@@ -144,7 +152,7 @@ int main()
 
     const std::vector<std::string> protectedTargets = {
         "/api/v1/transactions", "/api/v1/transactions/" + first.transactionId,
-        "/api/v1/terminals", "/api/v1/assets"
+        "/api/v1/terminals", "/api/v1/assets", "/api/v1/adapters"
     };
     for (const auto& target : protectedTargets)
     {
@@ -207,6 +215,42 @@ int main()
     assert(terminalJson.at("terminals").at(0).at("terminal_id") == "SIM-API-001");
     assert(terminalJson.at("terminals").at(0).at("simulated").get<bool>());
     assert(terminalJson.at("terminals").at(0).at("available").get<bool>());
+
+    const auto adapterResponse = sendRequest(server.boundPort(), "/api/v1/adapters", bearer);
+    assert(adapterResponse.status == 200);
+    const auto adapterJson = parsed(adapterResponse);
+    assert(adapterJson.at("adapters").size() == 3);
+
+    const auto findAdapter = [&](const std::string& id) -> const nlohmann::json&
+    {
+        for (const auto& item : adapterJson.at("adapters"))
+        {
+            if (item.at("adapter_id") == id)
+                return item;
+        }
+
+        assert(false && "Expected adapter was not returned");
+        return adapterJson.at("adapters").at(0);
+    };
+
+    const auto& simulatedAdapter = findAdapter("paybridge.simulated.v1");
+    assert(simulatedAdapter.at("execution_scope") == "SIMULATION_ONLY");
+    assert(simulatedAdapter.at("verification_status") == "SIMULATED");
+
+    const auto& verifoneSimulator =
+        findAdapter("paybridge.verifone.vx680.simulator.v1");
+    assert(verifoneSimulator.at("execution_scope") == "SIMULATION_PROFILE_ONLY");
+    assert(verifoneSimulator.at("verification_status") == "SIMULATED");
+
+    const auto& unverifiedVerifone =
+        findAdapter("paybridge.verifone.vx680.unverified");
+    assert(unverifiedVerifone.at("execution_scope") == "BLOCKED_UNTIL_VERIFIED");
+    assert(unverifiedVerifone.at("verification_status") == "UNVERIFIED");
+
+    assert(sendRequest(server.boundPort(), "/api/v1/adapters",
+        bearer, http::verb::post).status == 405);
+    assert(sendRequest(server.boundPort(), "/api/v1/adapters?unexpected=value",
+        bearer).status == 400);
 
     const auto assetResponse = sendRequest(server.boundPort(), "/api/v1/assets", bearer);
     assert(assetResponse.status == 200);

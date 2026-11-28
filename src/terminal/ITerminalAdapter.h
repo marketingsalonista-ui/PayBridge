@@ -10,6 +10,16 @@
 namespace paybridge::terminal
 {
 
+struct AdapterMetadata
+{
+    std::string displayName;
+    std::string manufacturer;
+    std::string deviceModel;
+    std::string executionScope;
+    std::string verificationStatus;
+    std::string description;
+};
+
 struct AdapterPreflightResult
 {
     bool ready = true;
@@ -29,6 +39,21 @@ public:
     virtual ~ITerminalAdapter() = default;
 
     virtual std::string adapterId() const = 0;
+
+    // Descriptive, read-only metadata. It does not affect adapter selection
+    // or payment execution.
+    virtual AdapterMetadata metadata() const
+    {
+        return {
+            adapterId(),
+            "Unknown",
+            "Unknown",
+            "UNSPECIFIED",
+            "UNVERIFIED",
+            "No adapter metadata supplied"
+        };
+    }
+
     virtual bool supports(const TerminalModel& terminal) const = 0;
 
     // Called before the manager inspects or opens the transport.

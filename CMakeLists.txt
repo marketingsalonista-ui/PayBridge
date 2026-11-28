@@ -216,6 +216,8 @@ add_executable(DashboardApiServerTests
     src/terminal/SimulatedTerminalProtocol.cpp
     src/terminal/SimulatedTerminalPeer.cpp
     src/terminal/SimulatedTerminalAdapter.cpp
+    src/terminal/VerifoneVx680SimulatorAdapter.cpp
+    src/terminal/Vx680UnverifiedAdapter.cpp
     src/transports/TransportResult.cpp
 )
 

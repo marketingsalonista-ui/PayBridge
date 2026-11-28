@@ -69,6 +69,20 @@ export interface AssetsResponse {
   assets: AssetDto[]
 }
 
+export interface AdapterDto {
+  adapter_id: string
+  display_name: string
+  manufacturer: string
+  device_model: string
+  execution_scope: string
+  verification_status: string
+  description: string
+}
+
+export interface AdaptersResponse {
+  adapters: AdapterDto[]
+}
+
 export interface TransactionQuery {
   limit?: number
   status?: TransactionStatus
@@ -172,6 +186,10 @@ export class PayBridgeApiService {
 
   getAssets(signal?: AbortSignal): Promise<AssetsResponse> {
     return this.get('/assets', signal)
+  }
+
+  getAdapters(signal?: AbortSignal): Promise<AdaptersResponse> {
+    return this.get('/adapters', signal)
   }
 }
 
