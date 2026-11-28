@@ -13,8 +13,9 @@
 
 namespace
 {
-constexpr const char* SCHEMA_VERSION = "2";
-constexpr const char* PREVIOUS_SCHEMA_VERSION = "1";
+constexpr const char* SCHEMA_VERSION = "3";
+constexpr const char* PREVIOUS_SCHEMA_VERSION = "2";
+constexpr const char* OLDEST_SUPPORTED_SCHEMA_VERSION = "1";
 constexpr std::size_t MAX_TRANSACTION_PAGE_SIZE = 100;
 constexpr std::size_t MAX_CURSOR_TRANSACTION_ID_LENGTH = 256;
 std::mutex databasePathMutex;
@@ -157,6 +158,7 @@ bool readTransactionRecord(sqlite3_stmt* statement, TransactionReadRecord& recor
     record.createdAtUnix = sqlite3_column_int64(statement, 9);
     record.updatedAtUnix = sqlite3_column_int64(statement, 10);
     record.terminalId = sqliteText(statement, 11);
+    record.adapterId = sqliteText(statement, 12);
     return true;
 }
 }
@@ -249,6 +251,7 @@ CREATE TABLE IF NOT EXISTS transactions (
     legacy_imported INTEGER NOT NULL DEFAULT 0 CHECK (legacy_imported IN (0,1)),
     created_at_unix INTEGER NOT NULL CHECK (created_at_unix >= 0),
     updated_at_unix INTEGER NOT NULL CHECK (updated_at_unix >= created_at_unix),
+    adapter_id TEXT,
     UNIQUE (transaction_id, external_reference)
 );
 
@@ -393,7 +396,8 @@ bool TransactionRepository::initialize()
         const std::string version = rc == SQLITE_ROW ? sqliteText(versionStmt, 0) : std::string{};
         sqlite3_finalize(versionStmt);
         if (rc != SQLITE_ROW ||
-            (version != SCHEMA_VERSION && version != PREVIOUS_SCHEMA_VERSION))
+            (version != SCHEMA_VERSION && version != PREVIOUS_SCHEMA_VERSION &&
+             version != OLDEST_SUPPORTED_SCHEMA_VERSION))
         { lastError_ = "Unsupported or missing SQLite schema version"; return fail(); }
     }
 
@@ -442,10 +446,13 @@ bool TransactionRepository::initialize()
     if (!hasColumn("replay_records", "simulation_contract") &&
         !executeSql("ALTER TABLE replay_records ADD COLUMN simulation_contract TEXT;"))
     { lastError_ = sqlite3_errmsg(database); return fail(); }
+    if (!hasColumn("transactions", "adapter_id") &&
+        !executeSql("ALTER TABLE transactions ADD COLUMN adapter_id TEXT;"))
+    { lastError_ = sqlite3_errmsg(database); return fail(); }
 
     if (!hasMetadata && !executeSql("INSERT INTO schema_metadata(metadata_key, metadata_value) VALUES ('schema_version','1');"))
     { lastError_ = sqlite3_errmsg(database); return fail(); }
-    if (!executeSql("UPDATE schema_metadata SET metadata_value='2' WHERE metadata_key='schema_version';"))
+    if (!executeSql("UPDATE schema_metadata SET metadata_value='3' WHERE metadata_key='schema_version';"))
     { lastError_ = sqlite3_errmsg(database); return fail(); }
 
     if (!executeSql("COMMIT;"))
@@ -829,7 +836,8 @@ bool TransactionRepository::updateTransactionStatusImpl(
     }
 
     statement = nullptr;
-    const char* sql = "UPDATE transactions SET lifecycle_state = ?, updated_at_unix = ? WHERE transaction_id = ?;";
+    const char* sql = "UPDATE transactions SET lifecycle_state = ?, updated_at_unix = ?, "
+                      "adapter_id = COALESCE(NULLIF(?, ''), adapter_id) WHERE transaction_id = ?;";
 
     if (sqlite3_prepare_v2(database, sql, -1, &statement, nullptr) != SQLITE_OK)
         return fail();
@@ -839,7 +847,8 @@ bool TransactionRepository::updateTransactionStatusImpl(
 
     bindText(statement, 1, TransactionEngine::statusToString(transaction.status));
     sqlite3_bind_int64(statement, 2, now);
-    bindText(statement, 3, transaction.transactionId);
+    bindText(statement, 3, transaction.adapterId);
+    bindText(statement, 4, transaction.transactionId);
 
     const bool success = sqlite3_step(statement) == SQLITE_DONE;
     const bool changed = success && sqlite3_changes(database) == 1;
@@ -1003,7 +1012,8 @@ SELECT t.transaction_id, t.amount_units, t.money_precision, COALESCE(t.currency,
        COALESCE((SELECT r.terminal_id FROM replay_records r
                  WHERE r.transaction_id=t.transaction_id
                    AND r.terminal_id IS NOT NULL AND r.terminal_id <> ''
-                 ORDER BY r.updated_at_unix DESC, r.request_id DESC LIMIT 1),'')
+                 ORDER BY r.updated_at_unix DESC, r.request_id DESC LIMIT 1),''),
+       COALESCE(t.adapter_id,'')
 FROM transactions t
 )SQL";
     std::string sql = baseSql;
@@ -1088,7 +1098,8 @@ SELECT t.transaction_id, t.amount_units, t.money_precision, COALESCE(t.currency,
        COALESCE((SELECT r.terminal_id FROM replay_records r
                  WHERE r.transaction_id=t.transaction_id
                    AND r.terminal_id IS NOT NULL AND r.terminal_id <> ''
-                 ORDER BY r.updated_at_unix DESC, r.request_id DESC LIMIT 1),'')
+                 ORDER BY r.updated_at_unix DESC, r.request_id DESC LIMIT 1),''),
+       COALESCE(t.adapter_id,'')
 FROM transactions t WHERE t.transaction_id=?
 )SQL";
     sqlite3_stmt* statement = nullptr;

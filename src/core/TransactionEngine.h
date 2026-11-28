@@ -37,6 +37,7 @@ struct TransactionReadRecord
     std::int64_t createdAtUnix = 0;
     std::int64_t updatedAtUnix = 0;
     std::string terminalId;
+    std::string adapterId;
 };
 
 struct TransactionCursor
@@ -65,6 +66,9 @@ struct Transaction
     // Complete asset identity and exact-money representation.
     paybridge::assets::Asset asset;
     paybridge::money::Money money;
+
+    // Adapter that handled this transaction. Empty means "do not change the stored value".
+    std::string adapterId;
 };
 
 enum class ReplayState
