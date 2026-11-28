@@ -24,6 +24,7 @@ struct LegacyCsvRecord
     std::string rawRecord;
     std::string rawRecordHash;
     bool valid = false;
+    bool auditOnly = false;
     std::string diagnostic;
     Transaction transaction;
 };

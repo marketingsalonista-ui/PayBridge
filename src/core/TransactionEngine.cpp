@@ -136,6 +136,7 @@ bool TransactionEngine::initialize()
                 record.rawRecordHash = hashHex(csvRecord.rawRecord);
                 const bool legacySevenColumnRow = csvRecord.columnCount == 7;
                 record.valid = csvRecord.valid;
+                record.auditOnly = csvRecord.auditOnly;
                 record.diagnostic = csvRecord.diagnostic;
                 record.transaction = csvRecord.transaction;
 

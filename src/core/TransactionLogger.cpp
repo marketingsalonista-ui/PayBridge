@@ -393,6 +393,9 @@ TransactionLogger::CsvReadReport TransactionLogger::readTransactionsFromFile(
         std::vector<std::string> fields;
         std::string rawHeader;
         const CsvReadResult headerResult = readCsvRecord(file, fields, &rawHeader);
+        const std::vector<std::string> historicalHeader = {
+            "Transaction ID", "Amount", "Currency", "Status",
+            "Timestamp", "Environment"};
         const std::vector<std::string> legacyHeader = {
             "TransactionID", "ExternalReference", "AmountMinor", "Currency",
             "Status", "Timestamp", "Environment"};
@@ -401,7 +404,7 @@ TransactionLogger::CsvReadReport TransactionLogger::readTransactionsFromFile(
             "Status", "Timestamp", "Environment", "AssetType", "AssetCode",
             "AssetNetwork", "ContractAddress", "DecimalPrecision"};
         if (headerResult != CsvReadResult::RECORD ||
-            (fields != legacyHeader && fields != currentHeader))
+            (fields != historicalHeader && fields != legacyHeader && fields != currentHeader))
         {
             report.rawHeader = std::move(rawHeader);
             report.diagnostic = "CSV header is missing, malformed, or unsupported";
@@ -427,8 +430,17 @@ TransactionLogger::CsvReadReport TransactionLogger::readTransactionsFromFile(
             else
             {
                 record.columnCount = fields.size();
-                record.valid = parseTransactionRecord(
-                    fields, record.transaction, record.diagnostic);
+                if (fields.size() == 6)
+                {
+                    record.auditOnly = true;
+                    record.diagnostic =
+                        "Six-column historical record retained for audit; not imported";
+                }
+                else
+                {
+                    record.valid = parseTransactionRecord(
+                        fields, record.transaction, record.diagnostic);
+                }
             }
             report.records.push_back(std::move(record));
         }

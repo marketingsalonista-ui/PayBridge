@@ -1193,6 +1193,10 @@ LegacyMigrationResult TransactionRepository::importLegacyCsv(
             report.diagnostics.push_back("CSV row number is missing or duplicated");
             continue;
         }
+        if (row.auditOnly)
+        {
+            continue;
+        }
         if (!row.valid)
         {
             ++report.conflictCount;

@@ -16,6 +16,7 @@ public:
         std::string rawRecord;
         Transaction transaction;
         bool valid = false;
+        bool auditOnly = false;
         std::string diagnostic;
     };
 

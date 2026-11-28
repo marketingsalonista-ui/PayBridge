@@ -455,6 +455,50 @@ int main()
         }
     }
 
+    // Mixed historical six-column and verified twelve-column rows:
+    // retain ambiguous rows for audit while importing verified lifecycle rows.
+    {
+        const std::string mixedCsv = (suiteRoot / "migration-mixed-history.csv").string();
+        const std::string mixedDb = (suiteRoot / "migration-mixed-history.sqlite").string();
+
+        {
+            std::ofstream file(mixedCsv, std::ios::binary);
+            file << "Transaction ID,Amount,Currency,Status,Timestamp,Environment\r\n"
+                 << "PB-000001,123.00,AED,RECEIVED,2026-11-24 01:06:59,SIMULATION\r\n"
+                 << "PB-000001,123.00,AED,RECEIVED,2026-11-24 01:06:59,SIMULATION\r\n"
+                 << "PB-000001,12.00,AED,RECEIVED,2026-11-24 01:09:25,SIMULATION\r\n"
+                 << "PB-000001,54.00,AED,RECEIVED,2026-11-24 01:09:37,SIMULATION\r\n"
+                 << "PB-000001,57.00,AED,RECEIVED,2026-11-24 01:09:50,SIMULATION\r\n"
+                 << "PB-OLD-006,12.00,AED,RECEIVED,2026-11-24 01:11:53,SIMULATION\r\n"
+                 << "PB-OLD-007,45.00,AED,RECEIVED,2026-11-24 01:12:01,SIMULATION\r\n"
+                 << "PB-OLD-008,90.00,AED,RECEIVED,2026-11-24 01:12:05,SIMULATION\r\n"
+                 << "PB-NEW-001,POS-AUTH-001,1000,AED,CREATED,2026-11-24 16:54:20,SIMULATION,FIAT,AED,,,2\r\n"
+                 << "PB-NEW-001,POS-AUTH-001,1000,AED,SENT,2026-11-24 16:54:20,SIMULATION,FIAT,AED,,,2\r\n"
+                 << "PB-NEW-001,POS-AUTH-001,1000,AED,RECEIVED,2026-11-24 16:54:20,SIMULATION,FIAT,AED,,,2\r\n";
+        }
+
+        TransactionEngine mixed(mixedDb, mixedCsv);
+        assert(mixed.initialize());
+
+        Transaction recovered = mixed.createTransaction(
+            1000, "AED", "POS-AUTH-001");
+        assert(recovered.status == TransactionStatus::RECEIVED);
+
+        sqlite3* raw = nullptr;
+        assert(sqlite3_open(mixedDb.c_str(), &raw) == SQLITE_OK);
+
+        sqlite3_stmt* auditQuery = nullptr;
+        assert(sqlite3_prepare_v2(raw,
+            "SELECT COUNT(*), "
+            "SUM(CASE WHEN transaction_id IS NULL THEN 1 ELSE 0 END) "
+            "FROM migration_legacy_rows",
+            -1, &auditQuery, nullptr) == SQLITE_OK);
+        assert(sqlite3_step(auditQuery) == SQLITE_ROW);
+        assert(sqlite3_column_int(auditQuery, 0) == 11);
+        assert(sqlite3_column_int(auditQuery, 1) == 8);
+        sqlite3_finalize(auditQuery);
+        assert(sqlite3_close(raw) == SQLITE_OK);
+    }
     // Seven-column legacy fiat rows infer exact precision from the registry.
     {
         const std::string legacyCsv = (suiteRoot / "migration-legacy-seven.csv").string();
@@ -1761,7 +1805,6 @@ int main()
             "Authorization: Bearer " + testToken + "\n" + alteredReplay.dump());
         assert(conflictingReplay.value("error_code", "") == "REPLAY_CONFLICT");
 
-        std::cerr << "VALID_LF_RESPONSE=" << validLf.dump() << std::endl;
 
         std::string paymentCrlf = payment;
         const std::string lfReference = "POS-AUTH-001";
