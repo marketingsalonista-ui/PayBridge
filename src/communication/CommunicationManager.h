@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "../core/TransactionEngine.h"
 #include "../security/AuthManager.h"
@@ -17,6 +17,7 @@ public:
 
     nlohmann::json handleRequest(const std::string& request) const;
     const paybridge::terminal::TerminalManager& terminalManagerReadOnly() const noexcept;
+    PaymentOrchestrationService& paymentService() noexcept;
 
 private:
     TransactionEngine& engine;

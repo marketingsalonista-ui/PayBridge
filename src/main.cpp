@@ -1,4 +1,4 @@
-﻿#include <iostream>
+#include <iostream>
 #include <cstdlib>
 #include <atomic>
 #include <windows.h>
@@ -69,7 +69,8 @@ int main()
     std::cout << "[READY] Communication Manager\n";
 
     DashboardApiServer dashboardApi({}, authManager, engine,
-        communication.terminalManagerReadOnly(), engine.assets());
+        communication.terminalManagerReadOnly(), engine.assets(),
+        communication.paymentService());
     if (!dashboardApi.start())
     {
         std::cerr << "[ERROR] Dashboard HTTP server failed to start on 127.0.0.1:5051\n";

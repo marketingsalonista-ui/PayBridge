@@ -1,4 +1,4 @@
-﻿#include "CommunicationManager.h"
+#include "CommunicationManager.h"
 #include "../protocol/JsonHandler.h"
 #include "../terminal/SimulatedTerminalTransport.h"
 #include "../terminal/SimulatedTerminalAdapter.h"
@@ -147,6 +147,11 @@ nlohmann::json CommunicationManager::handleRequest(const std::string& request) c
 const paybridge::terminal::TerminalManager& CommunicationManager::terminalManagerReadOnly() const noexcept
 {
     return terminalManager;
+}
+
+PaymentOrchestrationService& CommunicationManager::paymentService() noexcept
+{
+    return orchestrationService;
 }
 
 int CommunicationManager::runServer(unsigned short port,

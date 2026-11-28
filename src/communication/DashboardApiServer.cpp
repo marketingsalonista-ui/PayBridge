@@ -193,10 +193,12 @@ public:
     explicit Impl(Config value, AuthManager auth = AuthManager::fromEnvironment(),
         TransactionEngine* engine = nullptr,
         const paybridge::terminal::TerminalManager* terminals = nullptr,
-        const paybridge::assets::AssetRegistry* assets = nullptr)
+        const paybridge::assets::AssetRegistry* assets = nullptr,
+        PaymentOrchestrationService* payments = nullptr)
         : config(normalize(std::move(value))), context(config.workerCount),
           acceptor(context), authManager(std::move(auth)),
-          transactionEngine(engine), terminalManager(terminals), assetRegistry(assets)
+          transactionEngine(engine), terminalManager(terminals), assetRegistry(assets),
+          paymentService(payments)
     {
     }
 
@@ -608,6 +610,7 @@ private:
     TransactionEngine* transactionEngine = nullptr;
     const paybridge::terminal::TerminalManager* terminalManager = nullptr;
     const paybridge::assets::AssetRegistry* assetRegistry = nullptr;
+    PaymentOrchestrationService* paymentService = nullptr;
 #ifdef _WIN32
     bool winsockStarted = false;
 #endif
@@ -629,6 +632,16 @@ DashboardApiServer::DashboardApiServer(Config config, const AuthManager& authMan
     const paybridge::assets::AssetRegistry& assetRegistry)
     : impl(std::make_unique<Impl>(std::move(config), authManager, &transactionEngine,
         &terminalManager, &assetRegistry))
+{
+}
+
+DashboardApiServer::DashboardApiServer(Config config, const AuthManager& authManager,
+    TransactionEngine& transactionEngine,
+    const paybridge::terminal::TerminalManager& terminalManager,
+    const paybridge::assets::AssetRegistry& assetRegistry,
+    PaymentOrchestrationService& paymentService)
+    : impl(std::make_unique<Impl>(std::move(config), authManager, &transactionEngine,
+        &terminalManager, &assetRegistry, &paymentService))
 {
 }
 

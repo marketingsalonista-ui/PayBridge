@@ -8,6 +8,7 @@ class AuthManager;
 class TransactionEngine;
 namespace paybridge::terminal { class TerminalManager; }
 namespace paybridge::assets { class AssetRegistry; }
+class PaymentOrchestrationService;
 
 class DashboardApiServer
 {
@@ -25,6 +26,11 @@ public:
         TransactionEngine& transactionEngine,
         const paybridge::terminal::TerminalManager& terminalManager,
         const paybridge::assets::AssetRegistry& assetRegistry);
+    DashboardApiServer(Config config, const AuthManager& authManager,
+        TransactionEngine& transactionEngine,
+        const paybridge::terminal::TerminalManager& terminalManager,
+        const paybridge::assets::AssetRegistry& assetRegistry,
+        PaymentOrchestrationService& paymentService);
     ~DashboardApiServer();
 
     DashboardApiServer(const DashboardApiServer&) = delete;
